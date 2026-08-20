@@ -1,5 +1,6 @@
 """Typed configuration for the OpenTelemetry instrumentation."""
 
+from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from typing import Annotated, Any, Final
@@ -97,6 +98,21 @@ class ExporterSpec(BaseModel):
             "auto (Simple for console/in_memory, Batch otherwise)."
         ),
     )
+
+
+@dataclass(frozen=True, slots=True)
+class TenantRoute:
+    """The OTLP destination one request's team/key credentials route to.
+
+    Credentials and the host they belong to travel as one value, and it is hashable
+    so the per-tenant provider cache keys on both. ``headers`` keeps the order its
+    builder emitted, which is the order the exporter receives as the OTLP header
+    string. ``endpoint`` unset means the exporter keeps the destination its preset
+    resolved from the environment.
+    """
+
+    headers: tuple[tuple[str, str], ...]
+    endpoint: str | None = None
 
 
 class OpenTelemetryV2Config(BaseSettings):

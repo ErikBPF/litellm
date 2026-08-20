@@ -212,10 +212,13 @@ lives in [`plumbing/`](./plumbing):
   token lazily) without coupling this module to any vendor.
 - [`context.py`](./plumbing/context.py) — trace-context and Baggage read/write helpers.
 - [`routing.py`](./plumbing/routing.py) — `TenantTracerCache`: when a request carries
-  team/key-scoped vendor credentials, route its spans through a credential-keyed
-  `TracerProvider` so one logger serves many tenants. The cache is a bounded LRU
-  that flushes + shuts down evicted providers, since the key derives from
-  request-supplied credentials and must not grow (or leak threads) without limit.
+  team/key-scoped vendor credentials, route its spans through a `TracerProvider`
+  keyed by the request's `TenantRoute` (those credentials plus the host they belong
+  to) so one logger serves many tenants. Keying on the credentials alone would let
+  two tenants holding the same credentials on different hosts share one exporter.
+  The cache is a bounded LRU that flushes + shuts down evicted providers, since the
+  key derives from request-supplied values and must not grow (or leak threads)
+  without limit.
 - [`metrics.py`](./plumbing/metrics.py) — GenAI client metric instruments. The
   six `gen_ai.client.*` histograms are recorded through the meter resolved by
   `providers.resolve_meter_provider`: an injected provider wins (tests/DI),
@@ -280,7 +283,9 @@ lives in [`plumbing/`](./plumbing):
   + resource attributes). `PRESET_BY_CALLBACK` maps a callback name (`"arize"`,
   `"langfuse_otel"`, …) to its preset. Integrations that support team/key-scoped
   credentials also provide a per-request OTLP header builder
-  (`DYNAMIC_HEADERS_BY_CALLBACK`). Presets do **no** network I/O at build time:
+  (`DYNAMIC_HEADERS_BY_CALLBACK`), and those whose dynamic params can name their own
+  host provide an endpoint builder too (`DYNAMIC_ENDPOINT_BY_CALLBACK`); both are
+  resolved together by `dynamic_otlp_route`. Presets do **no** network I/O at build time:
   AgentOps, for example, mints its JWT lazily inside a custom exporter on the
   first export (in the `BatchSpanProcessor` worker thread), never on the event
   loop.
@@ -296,6 +301,8 @@ lives in [`plumbing/`](./plumbing):
 - **A new integration**: add a preset in `presets/` that returns an
   `OpenTelemetryV2Config`, and register it in `presets/__init__.PRESET_BY_CALLBACK`.
   If it supports dynamic credentials, add a header builder to
-  `DYNAMIC_HEADERS_BY_CALLBACK`.
+  `DYNAMIC_HEADERS_BY_CALLBACK`; if its dynamic params can also name a host, add an
+  endpoint builder to `DYNAMIC_ENDPOINT_BY_CALLBACK` (a callback with an endpoint
+  builder and no header builder never routes, so credentials and host stay paired).
 - **A new span kind**: add a role to `spans.py` (registry entry + name builder),
   a payload dataclass in `payloads.py`, and a branch in the relevant mapper(s).
