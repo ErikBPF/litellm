@@ -3379,3 +3379,95 @@ def test_organization_daily_activity_not_granted_by_org_admin_request_data_branc
         route="/organization/daily/activity",
         allowed_routes=LiteLLMRoutes.org_admin_only_routes.value,
     )
+
+
+TEAM_CALLBACK_ROUTES = (
+    "/team/06bda574-5ca9-43d3-beb8-3b23c2f17112/callback",
+    "/team/06bda574-5ca9-43d3-beb8-3b23c2f17112/callback/langfuse",
+    # the routes register team_id with the :path converter, so a team id may
+    # contain a slash
+    "/team/tenant/06bda574/callback",
+    "/team/tenant/06bda574/callback/langfuse",
+)
+
+
+def _gate(route, role):
+    """Drive the real route gate for a non-proxy-admin caller."""
+    user_obj = LiteLLM_UserTable(
+        user_id="team_admin_user",
+        user_email="team-admin@example.com",
+        user_role=role,
+    )
+    request = MagicMock(spec=Request)
+    request.query_params = {}
+    RouteChecks.non_proxy_admin_allowed_routes_check(
+        user_obj=user_obj,
+        _user_role=role,
+        route=route,
+        request=request,
+        valid_token=UserAPIKeyAuth(user_id="team_admin_user", user_role=role),
+        request_data={},
+    )
+
+
+def test_team_callback_routes_are_self_managed():
+    """The grant has to come from self_managed_routes specifically.
+
+    That list is the one whose entries carry no role predicate, so the handler
+    decides. Granting the same paths through internal_user_routes instead would
+    look identical for an internal_user while silently denying the org admins and
+    view-only roles that list does not cover.
+    """
+    assert "/team/{team_id:path}/callback" in LiteLLMRoutes.self_managed_routes.value
+    assert "/team/{team_id:path}/callback/{callback_name}" in LiteLLMRoutes.self_managed_routes.value
+
+
+@pytest.mark.parametrize("route", TEAM_CALLBACK_ROUTES)
+@pytest.mark.parametrize(
+    "role",
+    [
+        LitellmUserRoles.INTERNAL_USER.value,
+        LitellmUserRoles.INTERNAL_USER_VIEW_ONLY.value,
+        LitellmUserRoles.ORG_ADMIN.value,
+    ],
+)
+def test_team_callback_routes_reach_their_handler_for_non_admins(route, role):
+    """A team admin manages their own team's logging callbacks, so the route gate
+    must let a non-proxy-admin through to the handler.
+
+    The handler is what authorizes: every team callback endpoint calls
+    _verify_team_access, which admits only a proxy admin, an org admin for the
+    team, or an admin of that team, and 403s everyone else. Before this, the gate
+    rejected the team admin with a 401 naming proxy admin, so the handler's own
+    check was unreachable for them.
+    """
+    _gate(route, role)
+
+
+def test_team_disable_logging_stays_proxy_admin_only():
+    """disable_logging was left out of the grant, so it must still be rejected at
+    the gate. It is the one team callback route a team admin cannot reach."""
+    with pytest.raises(Exception) as exc_info:
+        _gate(
+            "/team/06bda574-5ca9-43d3-beb8-3b23c2f17112/disable_logging",
+            LitellmUserRoles.INTERNAL_USER.value,
+        )
+
+    assert "disable_logging" in str(exc_info.value)
+    assert "Only proxy admin" in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "route",
+    [
+        "/team/06bda574-5ca9-43d3-beb8-3b23c2f17112",
+        "/team/update",
+        "/team/06bda574-5ca9-43d3-beb8-3b23c2f17112/model/add",
+    ],
+)
+def test_neighbouring_team_routes_stay_closed(route):
+    """The grant is the callback paths and nothing else on the team namespace."""
+    with pytest.raises(Exception) as exc_info:
+        _gate(route, LitellmUserRoles.INTERNAL_USER.value)
+
+    assert "Only proxy admin" in str(exc_info.value)
