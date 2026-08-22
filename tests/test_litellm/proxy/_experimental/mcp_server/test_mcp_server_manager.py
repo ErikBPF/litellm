@@ -5249,16 +5249,58 @@ class TestMCPServerManager:
 
         invalidated: list[str] = []
 
-        with patch.object(
-            global_mcp_server_manager,
-            "invalidate_local_upstream_m2m_tokens",
-            new=AsyncMock(side_effect=lambda server_id: invalidated.append(server_id)),
+        with (
+            patch.object(
+                global_mcp_server_manager,
+                "invalidate_local_upstream_m2m_tokens",
+                new=AsyncMock(side_effect=lambda server_id: invalidated.append(server_id)),
+            ),
+            patch.object(global_mcp_server_manager, "refresh_local_server_from_db", new=AsyncMock()),
         ):
             await apply_mcp_upstream_m2m_invalidation("mcp:per_user_token:alice:srv-1")
             assert invalidated == []
             await apply_mcp_upstream_m2m_invalidation(mcp_oauth2_mint_invalidation_key("srv-1"))
 
         assert invalidated == ["srv-1"]
+
+    @pytest.mark.asyncio
+    async def test_broadcast_mint_invalidation_rereads_the_revoked_server_from_the_database(self):
+        """Dropping the cached token is not enough: a worker that did not serve the revoke still holds
+        the pre-revoke client_id/client_secret in its registry and would mint a replacement token."""
+        from litellm.proxy._experimental.mcp_server import db as mcp_db
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            apply_mcp_upstream_m2m_invalidation,
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
+            mcp_oauth2_mint_invalidation_key,
+        )
+
+        revoked_row = LiteLLM_MCPServerTable(
+            server_id="srv-1",
+            server_name="srv-1",
+            url="http://upstream/mcp",
+            transport=MCPTransport.http,
+            auth_type=MCPAuth.oauth2,
+            oauth2_flow="client_credentials",
+            created_at=None,
+            updated_at=None,
+        )
+        applied: list[LiteLLM_MCPServerTable] = []
+
+        with (
+            patch.object(global_mcp_server_manager, "invalidate_local_upstream_m2m_tokens", new=AsyncMock()),
+            patch.object(
+                global_mcp_server_manager,
+                "update_server",
+                new=AsyncMock(side_effect=lambda server: applied.append(server)),
+            ),
+            patch.object(mcp_db, "get_mcp_server", new=AsyncMock(return_value=revoked_row)),
+            patch("litellm.proxy.proxy_server.prisma_client", new=MagicMock()),
+        ):
+            await apply_mcp_upstream_m2m_invalidation(mcp_oauth2_mint_invalidation_key("srv-1"))
+
+        assert applied == [revoked_row]
 
     @pytest.mark.asyncio
     async def test_resolve_oauth2_headers_no_user_id(self):

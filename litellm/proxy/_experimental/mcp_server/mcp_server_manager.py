@@ -5579,6 +5579,26 @@ class MCPServerManager:
         mcp_oauth2_token_cache.invalidate(server_id)
         await self._cred_provider.invalidate_server_m2m_credentials(server_id)
 
+    async def refresh_local_server_from_db(self, server_id: str) -> None:
+        """Re-read one server's persisted config into this worker's registry.
+
+        Dropping the cached token is not enough on a worker that did not serve the revoke: its
+        registry entry still holds the pre-revoke ``client_id``/``client_secret``, and mints a
+        replacement token on the next request. Best-effort: the DB write has already committed.
+        """
+        from litellm.proxy._experimental.mcp_server.db import get_mcp_server  # noqa: PLC0415  # avoids circular import
+
+        try:
+            from litellm.proxy.proxy_server import prisma_client  # noqa: PLC0415  # avoids circular import
+
+            if prisma_client is None:
+                return
+            server: Final = await get_mcp_server(prisma_client, server_id)
+            if server is not None:
+                await self.update_server(server)
+        except Exception as exc:  # noqa: BLE001 - registry refresh is best-effort; the periodic reload is the backstop
+            verbose_logger.warning("Failed to refresh MCP server %s from the database: %s", server_id, exc)
+
     async def revoke_upstream_m2m_tokens(self, server_id: str) -> None:
         """Revoke a server's gateway-minted tokens on every worker, not just this one.
 
@@ -6579,3 +6599,4 @@ async def apply_mcp_upstream_m2m_invalidation(cache_key: str) -> None:
     if server_id is None:
         return
     await global_mcp_server_manager.invalidate_local_upstream_m2m_tokens(server_id)
+    await global_mcp_server_manager.refresh_local_server_from_db(server_id)
