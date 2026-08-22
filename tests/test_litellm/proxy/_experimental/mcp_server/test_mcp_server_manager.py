@@ -5204,6 +5204,63 @@ class TestMCPServerManager:
         assert published == [per_user_token_cache_key("alice", "srv-1")]
 
     @pytest.mark.asyncio
+    async def test_revoke_upstream_m2m_tokens_clears_both_mint_caches_and_broadcasts(self):
+        """A revoke has to reach the v2 token source that actually serves M2M traffic, the legacy
+        mint cache, and every other worker, or the gateway keeps minting or replaying upstream
+        access the admin just revoked."""
+        from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
+            mcp_oauth2_mint_invalidation_key,
+            mcp_oauth2_token_cache,
+        )
+
+        invalidated: list[str] = []
+
+        class _FakeProvider:
+            async def invalidate_server_m2m_credentials(self, server_id: str) -> None:
+                invalidated.append(server_id)
+
+        published: list[str] = []
+
+        async def _publish(cache_key: str) -> None:
+            published.append(cache_key)
+
+        mcp_oauth2_token_cache.set_cache("srv-1:identity", "tok-revoked")
+        mcp_oauth2_token_cache.set_cache("srv-2:identity", "tok-untouched")
+
+        manager = MCPServerManager(cred_provider=_FakeProvider(), publish_cache_invalidation=_publish)
+        await manager.revoke_upstream_m2m_tokens("srv-1")
+
+        assert invalidated == ["srv-1"]
+        assert published == [mcp_oauth2_mint_invalidation_key("srv-1")]
+        assert mcp_oauth2_token_cache.get_cache("srv-1:identity") is None
+        assert mcp_oauth2_token_cache.get_cache("srv-2:identity") == "tok-untouched"
+
+    @pytest.mark.asyncio
+    async def test_broadcast_mint_invalidation_only_fires_for_its_own_keys(self):
+        """The channel carries every management-object eviction, so a receiving worker must not read
+        a per-user key as a server id and wipe an unrelated server's minted tokens."""
+        from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+            apply_mcp_upstream_m2m_invalidation,
+            global_mcp_server_manager,
+        )
+        from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
+            mcp_oauth2_mint_invalidation_key,
+        )
+
+        invalidated: list[str] = []
+
+        with patch.object(
+            global_mcp_server_manager,
+            "invalidate_local_upstream_m2m_tokens",
+            new=AsyncMock(side_effect=lambda server_id: invalidated.append(server_id)),
+        ):
+            await apply_mcp_upstream_m2m_invalidation("mcp:per_user_token:alice:srv-1")
+            assert invalidated == []
+            await apply_mcp_upstream_m2m_invalidation(mcp_oauth2_mint_invalidation_key("srv-1"))
+
+        assert invalidated == ["srv-1"]
+
+    @pytest.mark.asyncio
     async def test_resolve_oauth2_headers_no_user_id(self):
         """Skip lookup entirely when user_api_key_auth has no user_id."""
         from litellm.proxy._types import UserAPIKeyAuth

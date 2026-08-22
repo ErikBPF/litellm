@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -101,7 +101,7 @@ class AuthCacheInvalidationSubscriber:
         self,
         redis_cache: "RedisCache",
         user_api_key_cache: "UserApiKeyCache",
-        local_invalidators: Sequence[Callable[[str], None]] = (),
+        local_invalidators: Sequence[Callable[[str], Awaitable[None]]] = (),
     ) -> None:
         self._redis_cache = redis_cache
         self._user_api_key_cache = user_api_key_cache
@@ -158,9 +158,9 @@ class AuthCacheInvalidationSubscriber:
             message = await pubsub.get_message(ignore_subscribe_messages=True, timeout=_POLL_TIMEOUT_SECONDS)
             if message is None:
                 continue
-            self._apply_message(message)
+            await self._apply_message(message)
 
-    def _apply_message(self, message: object) -> None:
+    async def _apply_message(self, message: object) -> None:
         data: Final = message.get("data") if isinstance(message, dict) else None
         cache_key: Final = _cache_key_from_message_data(data)
         if cache_key is None:
@@ -170,7 +170,7 @@ class AuthCacheInvalidationSubscriber:
             in_memory_cache.delete_cache(cache_key)
         for invalidate_local in self._local_invalidators:
             try:
-                invalidate_local(cache_key)
+                await invalidate_local(cache_key)
             except Exception as e:  # noqa: BLE001  # one bad invalidator must not stop the subscriber
                 verbose_proxy_logger.warning("auth cache invalidation local handler failed for %s: %s", cache_key, e)
 

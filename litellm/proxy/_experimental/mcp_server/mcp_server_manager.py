@@ -70,9 +70,12 @@ from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
 )
 from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
     MCPPerUserTokenCache,
+    mcp_oauth2_mint_invalidation_key,
+    mcp_oauth2_token_cache,
     mcp_per_user_token_cache,
     per_user_token_cache_key,
     resolve_mcp_auth,
+    server_id_from_mint_invalidation_key,
 )
 from litellm.proxy._experimental.mcp_server.oauth_utils import (
     _redact_mcp_resource_url,
@@ -5567,6 +5570,25 @@ class MCPServerManager:
             )
         await self._publish_cache_invalidation(per_user_token_cache_key(user_id, server_id))
 
+    async def invalidate_local_upstream_m2m_tokens(self, server_id: str) -> None:
+        """Drop this worker's cached gateway-minted (``client_credentials``) tokens for a server.
+
+        Both mint caches are process-local, so this is per worker; ``revoke_upstream_m2m_tokens``
+        is what makes a revoke reach the others.
+        """
+        mcp_oauth2_token_cache.invalidate(server_id)
+        await self._cred_provider.invalidate_server_m2m_credentials(server_id)
+
+    async def revoke_upstream_m2m_tokens(self, server_id: str) -> None:
+        """Revoke a server's gateway-minted tokens on every worker, not just this one.
+
+        A worker that already minted keeps a usable upstream token in memory, so invalidating only
+        the worker that served the admin request left the revoked authorization in use until its
+        TTL. Best-effort broadcast: the DB write has already committed.
+        """
+        await self.invalidate_local_upstream_m2m_tokens(server_id)
+        await self._publish_cache_invalidation(mcp_oauth2_mint_invalidation_key(server_id))
+
     async def _resolve_oauth2_headers_for_tool_call(
         self,
         mcp_server: MCPServer,
@@ -6544,3 +6566,16 @@ class MCPServerManager:
 
 
 global_mcp_server_manager: Final[MCPServerManager] = MCPServerManager()
+
+
+async def apply_mcp_upstream_m2m_invalidation(cache_key: str) -> None:
+    """Handle a broadcast mint-invalidation key on the worker that receives it.
+
+    The auth cache invalidation subscriber evicts the shared ``user_api_key_cache`` only, which
+    cannot reach the process-local mint caches holding a usable upstream token, so it routes
+    broadcast keys here. Any other key is ignored.
+    """
+    server_id: Final = server_id_from_mint_invalidation_key(cache_key)
+    if server_id is None:
+        return
+    await global_mcp_server_manager.invalidate_local_upstream_m2m_tokens(server_id)

@@ -6781,6 +6781,7 @@ def _make_admin_auth(user_id: str = "admin-abc") -> "UserAPIKeyAuth":
 def _patched_clear_oauth_token_endpoint(clear_mock, purge_mock, manager, revoke_mock):
     """Patch every collaborator the clear endpoint reaches, so a test can assert which stores it
     actually emptied rather than only what it returned."""
+    manager.revoke_upstream_m2m_tokens = revoke_mock
     with (
         patch(
             "litellm.proxy.management_endpoints.mcp_management_endpoints.get_prisma_client_or_throw",
@@ -6797,10 +6798,6 @@ def _patched_clear_oauth_token_endpoint(clear_mock, purge_mock, manager, revoke_
         patch(
             "litellm.proxy.management_endpoints.mcp_management_endpoints.global_mcp_server_manager",
             manager,
-        ),
-        patch(
-            "litellm.proxy.management_endpoints.mcp_management_endpoints.revoke_mcp_oauth2_mint_cache",
-            new=revoke_mock,
         ),
     ):
         yield
@@ -6916,6 +6913,7 @@ async def test_clear_mcp_server_oauth_token_endpoint_drives_a_real_purge_for_the
     server = generate_mock_mcp_server_db_record(server_id="srv-oauth")
     manager = _clear_oauth_token_manager()
     manager.invalidate_user_oauth_token_cache = AsyncMock()
+    manager.revoke_upstream_m2m_tokens = AsyncMock()
 
     with (
         patch(
@@ -6933,10 +6931,6 @@ async def test_clear_mcp_server_oauth_token_endpoint_drives_a_real_purge_for_the
         patch(
             "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager",
             manager,
-        ),
-        patch(
-            "litellm.proxy.management_endpoints.mcp_management_endpoints.revoke_mcp_oauth2_mint_cache",
-            new=AsyncMock(),
         ),
     ):
         result = await clear_mcp_server_oauth_token_endpoint(

@@ -164,9 +164,6 @@ if MCP_AVAILABLE:
     from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
         global_mcp_server_manager,
     )
-    from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
-        revoke_mcp_oauth2_mint_cache,
-    )
     from litellm.proxy._experimental.mcp_server.ui_session_utils import (
         admitted_user_context,
         build_effective_auth_contexts,
@@ -2107,7 +2104,7 @@ if MCP_AVAILABLE:
         try:
             cleared_user_tokens: Final = await purge_user_oauth_credentials_for_server(prisma_client, server_id)
         finally:
-            await revoke_mcp_oauth2_mint_cache(server_id)
+            await global_mcp_server_manager.revoke_upstream_m2m_tokens(server_id)
             if cleared.changed_row:
                 await global_mcp_server_manager.update_server(cleared.server)
 

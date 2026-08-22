@@ -16,7 +16,7 @@ import threading
 import time
 import traceback
 import warnings
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, MutableMapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, MutableMapping, Sequence
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType, UnionType
 from typing import (
@@ -4168,18 +4168,18 @@ def should_load_db_object(object_type: str | SupportedDBObjectType) -> bool:
     return any(str(obj) == object_type_str for obj in supported_db_objects)
 
 
-def _local_cache_invalidators() -> tuple[Callable[[str], None], ...]:
+def _local_cache_invalidators() -> tuple[Callable[[str], Awaitable[None]], ...]:
     """Handlers for broadcast invalidation keys that name a process-local cache the shared
-    ``user_api_key_cache`` eviction cannot reach, such as the MCP client_credentials mint cache."""
+    ``user_api_key_cache`` eviction cannot reach, such as the MCP client_credentials mint caches."""
     from litellm.proxy._experimental.mcp_server.utils import is_mcp_available
 
     if not is_mcp_available():
         return ()
-    from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
-        apply_mcp_oauth2_mint_invalidation,
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (
+        apply_mcp_upstream_m2m_invalidation,
     )
 
-    return (apply_mcp_oauth2_mint_invalidation,)
+    return (apply_mcp_upstream_m2m_invalidation,)
 
 
 class ProxyConfig:
