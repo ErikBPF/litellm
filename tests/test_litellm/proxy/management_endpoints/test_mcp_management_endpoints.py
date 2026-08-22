@@ -6778,7 +6778,7 @@ def _make_admin_auth(user_id: str = "admin-abc") -> "UserAPIKeyAuth":
 
 
 @contextmanager
-def _patched_clear_oauth_token_endpoint(clear_mock, purge_mock, manager, token_cache):
+def _patched_clear_oauth_token_endpoint(clear_mock, purge_mock, manager, revoke_mock):
     """Patch every collaborator the clear endpoint reaches, so a test can assert which stores it
     actually emptied rather than only what it returned."""
     with (
@@ -6799,8 +6799,8 @@ def _patched_clear_oauth_token_endpoint(clear_mock, purge_mock, manager, token_c
             manager,
         ),
         patch(
-            "litellm.proxy.management_endpoints.mcp_management_endpoints.mcp_oauth2_token_cache",
-            token_cache,
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.revoke_mcp_oauth2_mint_cache",
+            new=revoke_mock,
         ),
     ):
         yield
@@ -6829,12 +6829,12 @@ async def test_clear_mcp_server_oauth_token_endpoint_empties_every_store_a_token
     )
 
     server = generate_mock_mcp_server_db_record(server_id="srv-oauth")
-    clear_mock = AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=True))
+    clear_mock = AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=True, cleared_client_credentials=False))
     purge_mock = AsyncMock(return_value=3)
     manager = _clear_oauth_token_manager()
-    token_cache = MagicMock()
+    revoke_mock = AsyncMock()
 
-    with _patched_clear_oauth_token_endpoint(clear_mock, purge_mock, manager, token_cache):
+    with _patched_clear_oauth_token_endpoint(clear_mock, purge_mock, manager, revoke_mock):
         result = await clear_mcp_server_oauth_token_endpoint(
             server_id="srv-oauth",
             user_api_key_dict=_make_admin_auth("admin-1"),
@@ -6848,7 +6848,7 @@ async def test_clear_mcp_server_oauth_token_endpoint_empties_every_store_a_token
     assert clear_mock.await_args.kwargs["touched_by"] == "admin-1"
     purge_mock.assert_awaited_once()
     assert purge_mock.await_args.args[1] == "srv-oauth"
-    token_cache.invalidate.assert_called_once_with("srv-oauth")
+    revoke_mock.assert_awaited_once_with("srv-oauth")
     manager.update_server.assert_awaited_once_with(server)
 
 
@@ -6868,13 +6868,13 @@ async def test_clear_mcp_server_oauth_token_endpoint_clears_per_user_tokens_with
     server = generate_mock_mcp_server_db_record(server_id="srv-oauth")
     purge_mock = AsyncMock(return_value=3)
     manager = _clear_oauth_token_manager()
-    token_cache = MagicMock()
+    revoke_mock = AsyncMock()
 
     with _patched_clear_oauth_token_endpoint(
-        AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=False)),
+        AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=False, cleared_client_credentials=False)),
         purge_mock,
         manager,
-        token_cache,
+        revoke_mock,
     ):
         result = await clear_mcp_server_oauth_token_endpoint(
             server_id="srv-oauth",
@@ -6924,7 +6924,7 @@ async def test_clear_mcp_server_oauth_token_endpoint_drives_a_real_purge_for_the
         ),
         patch(
             "litellm.proxy.management_endpoints.mcp_management_endpoints.clear_mcp_server_oauth_token",
-            new=AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=False)),
+            new=AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=False, cleared_client_credentials=False)),
         ),
         patch(
             "litellm.proxy.management_endpoints.mcp_management_endpoints.global_mcp_server_manager",
@@ -6934,7 +6934,10 @@ async def test_clear_mcp_server_oauth_token_endpoint_drives_a_real_purge_for_the
             "litellm.proxy._experimental.mcp_server.mcp_server_manager.global_mcp_server_manager",
             manager,
         ),
-        patch("litellm.proxy.management_endpoints.mcp_management_endpoints.mcp_oauth2_token_cache", MagicMock()),
+        patch(
+            "litellm.proxy.management_endpoints.mcp_management_endpoints.revoke_mcp_oauth2_mint_cache",
+            new=AsyncMock(),
+        ),
     ):
         result = await clear_mcp_server_oauth_token_endpoint(
             server_id="srv-oauth",
@@ -6965,13 +6968,13 @@ async def test_clear_mcp_server_oauth_token_endpoint_reconciles_caches_when_the_
 
     server = generate_mock_mcp_server_db_record(server_id="srv-oauth")
     manager = _clear_oauth_token_manager()
-    token_cache = MagicMock()
+    revoke_mock = AsyncMock()
 
     with _patched_clear_oauth_token_endpoint(
-        AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=True)),
+        AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=True, cleared_client_credentials=False)),
         AsyncMock(side_effect=RuntimeError("database went away mid-purge")),
         manager,
-        token_cache,
+        revoke_mock,
     ):
         with pytest.raises(RuntimeError, match="database went away mid-purge"):
             await clear_mcp_server_oauth_token_endpoint(
@@ -6979,7 +6982,7 @@ async def test_clear_mcp_server_oauth_token_endpoint_reconciles_caches_when_the_
                 user_api_key_dict=_make_admin_auth(),
             )
 
-    token_cache.invalidate.assert_called_once_with("srv-oauth")
+    revoke_mock.assert_awaited_once_with("srv-oauth")
     manager.update_server.assert_awaited_once_with(server)
 
 
@@ -6997,13 +7000,13 @@ async def test_clear_mcp_server_oauth_token_endpoint_reports_a_true_noop():
 
     server = generate_mock_mcp_server_db_record(server_id="srv-oauth")
     manager = _clear_oauth_token_manager()
-    token_cache = MagicMock()
+    revoke_mock = AsyncMock()
 
     with _patched_clear_oauth_token_endpoint(
-        AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=False)),
+        AsyncMock(return_value=ClearedMCPServerOAuthToken(server=server, had_token=False, cleared_client_credentials=False)),
         AsyncMock(return_value=0),
         manager,
-        token_cache,
+        revoke_mock,
     ):
         result = await clear_mcp_server_oauth_token_endpoint(
             server_id="srv-oauth",
@@ -7013,8 +7016,46 @@ async def test_clear_mcp_server_oauth_token_endpoint_reports_a_true_noop():
     assert result.cleared is False
     assert result.has_token is False
     assert result.cleared_user_tokens == 0
-    token_cache.invalidate.assert_called_once_with("srv-oauth")
+    revoke_mock.assert_awaited_once_with("srv-oauth")
     manager.update_server.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clear_mcp_server_oauth_token_endpoint_reports_a_dropped_m2m_grant():
+    """An M2M server has no per-user rows and may have nothing minted on the row yet, so dropping its
+    client grant is the whole disconnect: the registry has to be reloaded and the caller told what to
+    re-enter, or the dashboard reports a no-op on the one change that revoked access."""
+    if not mgmt_endpoints.MCP_AVAILABLE:
+        pytest.skip("MCP module not installed")
+
+    from litellm.proxy._experimental.mcp_server.db import ClearedMCPServerOAuthToken
+    from litellm.proxy.management_endpoints.mcp_management_endpoints import (
+        clear_mcp_server_oauth_token_endpoint,
+    )
+
+    server = generate_mock_mcp_server_db_record(server_id="srv-oauth")
+    manager = _clear_oauth_token_manager()
+    revoke_mock = AsyncMock()
+
+    with _patched_clear_oauth_token_endpoint(
+        AsyncMock(
+            return_value=ClearedMCPServerOAuthToken(
+                server=server, had_token=False, cleared_client_credentials=True
+            )
+        ),
+        AsyncMock(return_value=0),
+        manager,
+        revoke_mock,
+    ):
+        result = await clear_mcp_server_oauth_token_endpoint(
+            server_id="srv-oauth",
+            user_api_key_dict=_make_admin_auth(),
+        )
+
+    assert result.cleared is True
+    assert result.cleared_client_credentials is True
+    revoke_mock.assert_awaited_once_with("srv-oauth")
+    manager.update_server.assert_awaited_once_with(server)
 
 
 @pytest.mark.asyncio

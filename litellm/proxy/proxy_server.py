@@ -4168,6 +4168,20 @@ def should_load_db_object(object_type: str | SupportedDBObjectType) -> bool:
     return any(str(obj) == object_type_str for obj in supported_db_objects)
 
 
+def _local_cache_invalidators() -> tuple[Callable[[str], None], ...]:
+    """Handlers for broadcast invalidation keys that name a process-local cache the shared
+    ``user_api_key_cache`` eviction cannot reach, such as the MCP client_credentials mint cache."""
+    from litellm.proxy._experimental.mcp_server.utils import is_mcp_available
+
+    if not is_mcp_available():
+        return ()
+    from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
+        apply_mcp_oauth2_mint_invalidation,
+    )
+
+    return (apply_mcp_oauth2_mint_invalidation,)
+
+
 class ProxyConfig:
     """
     Abstraction class on top of config loading/updating logic. Gives us one place to control all config updating logic.
@@ -6773,6 +6787,7 @@ class ProxyConfig:
         subscriber: Final = AuthCacheInvalidationSubscriber(
             redis_cache=redis_cache,
             user_api_key_cache=user_api_key_cache,
+            local_invalidators=_local_cache_invalidators(),
         )
         self.auth_cache_invalidation_subscriber = subscriber
         subscriber.start()

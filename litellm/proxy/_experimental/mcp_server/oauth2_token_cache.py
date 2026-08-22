@@ -7,6 +7,7 @@ with ``client_id``, ``client_secret``, and ``token_url``.
 
 import asyncio
 import hashlib
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Final
 
 import httpx
@@ -14,6 +15,7 @@ import httpx
 from litellm._logging import verbose_logger
 from litellm.caching.in_memory_cache import InMemoryCache
 from litellm.constants import (
+    MCP_OAUTH2_MINT_INVALIDATION_KEY_PREFIX,
     MCP_OAUTH2_TOKEN_CACHE_DEFAULT_TTL,
     MCP_OAUTH2_TOKEN_CACHE_MAX_SIZE,
     MCP_OAUTH2_TOKEN_CACHE_MIN_TTL,
@@ -26,6 +28,9 @@ from litellm.llms.custom_httpx.http_handler import get_async_httpx_client
 from litellm.proxy._experimental.mcp_server.oauth_utils import (
     build_upstream_oauth2_token_request,
     resolve_upstream_resource,
+)
+from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
+    publish_auth_cache_invalidation,
 )
 from litellm.proxy.common_utils.encrypt_decrypt_utils import (
     decrypt_value_helper,
@@ -199,6 +204,42 @@ class MCPOAuth2TokenCache(InMemoryCache):
 mcp_oauth2_token_cache: Final = MCPOAuth2TokenCache()
 
 
+def mcp_oauth2_mint_invalidation_key(server_id: str) -> str:
+    return f"{MCP_OAUTH2_MINT_INVALIDATION_KEY_PREFIX}:{server_id}"
+
+
+async def revoke_mcp_oauth2_mint_cache(
+    server_id: str,
+    publish: Callable[[str], Awaitable[None]] = publish_auth_cache_invalidation,
+) -> None:
+    """Drop every minted client_credentials token for a server on this worker and every other one.
+
+    Local-only invalidation left the workers that had already minted serving the revoked
+    authorization until their TTL, so the revoke is broadcast as well.
+    """
+    mcp_oauth2_token_cache.invalidate(server_id)
+    await publish(mcp_oauth2_mint_invalidation_key(server_id))
+
+
+def apply_mcp_oauth2_mint_invalidation(cache_key: str) -> None:
+    """Drop this worker's minted client_credentials tokens for a broadcast invalidation key.
+
+    ``mcp_oauth2_token_cache`` is process-local, so a revoke on the worker that served the admin
+    request leaves every other worker holding a usable upstream token until its TTL. The auth cache
+    invalidation subscriber routes broadcast keys here so all workers drop the token together.
+    """
+    prefix: Final = f"{MCP_OAUTH2_MINT_INVALIDATION_KEY_PREFIX}:"
+    if not cache_key.startswith(prefix):
+        return
+    mcp_oauth2_token_cache.invalidate(cache_key.removeprefix(prefix))
+
+
+def per_user_token_cache_key(user_id: str, server_id: str) -> str:
+    """The ``user_api_key_cache`` key holding a user's token for a server. Shared by the legacy
+    per-user cache and the v2 store backend, so broadcasting this one key evicts both."""
+    return f"{MCP_PER_USER_TOKEN_REDIS_KEY_PREFIX}:{user_id}:{server_id}"
+
+
 def _compute_per_user_token_ttl(server: "MCPServer", expires_in: int | None) -> int:
     """Compute Redis TTL for a per-user token.
 
@@ -229,7 +270,7 @@ class MCPPerUserTokenCache:
     """
 
     def _cache_key(self, user_id: str, server_id: str) -> str:
-        return f"{MCP_PER_USER_TOKEN_REDIS_KEY_PREFIX}:{user_id}:{server_id}"
+        return per_user_token_cache_key(user_id, server_id)
 
     async def get(self, user_id: str, server_id: str) -> str | None:
         """Return the plaintext access_token, or None on miss/error."""

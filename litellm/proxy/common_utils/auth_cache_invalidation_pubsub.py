@@ -1,6 +1,6 @@
 import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Final
 
@@ -95,15 +95,17 @@ async def evict_and_broadcast(cache_keys: Sequence[str], user_api_key_cache: "Us
 
 
 class AuthCacheInvalidationSubscriber:
-    __slots__ = ("_redis_cache", "_task", "_user_api_key_cache")
+    __slots__ = ("_local_invalidators", "_redis_cache", "_task", "_user_api_key_cache")
 
     def __init__(
         self,
         redis_cache: "RedisCache",
         user_api_key_cache: "UserApiKeyCache",
+        local_invalidators: Sequence[Callable[[str], None]] = (),
     ) -> None:
         self._redis_cache = redis_cache
         self._user_api_key_cache = user_api_key_cache
+        self._local_invalidators = tuple(local_invalidators)
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -166,6 +168,11 @@ class AuthCacheInvalidationSubscriber:
         in_memory_cache: Final = self._user_api_key_cache.in_memory_cache
         if in_memory_cache is not None:
             in_memory_cache.delete_cache(cache_key)
+        for invalidate_local in self._local_invalidators:
+            try:
+                invalidate_local(cache_key)
+            except Exception as e:  # noqa: BLE001  # one bad invalidator must not stop the subscriber
+                verbose_proxy_logger.warning("auth cache invalidation local handler failed for %s: %s", cache_key, e)
 
     @staticmethod
     async def _close_pubsub(pubsub: _ConfigSyncPubSub) -> None:

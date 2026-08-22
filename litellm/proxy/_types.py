@@ -1578,6 +1578,7 @@ class MCPServerOAuthTokenStatus(LiteLLMPydanticObjectBase):
     has_token: bool
     cleared: bool = False
     cleared_user_tokens: int = 0
+    cleared_client_credentials: bool = False
 
 
 class MCPUserCredentialListItem(LiteLLMPydanticObjectBase):

@@ -3,6 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import MCPDisconnectDialog from "./MCPDisconnectDialog";
+import { toast } from "@/lib/toast";
 
 const deleteMCPServerOAuthToken = vi.fn();
 const deleteMCPOAuthUserCredential = vi.fn();
@@ -46,6 +47,7 @@ describe("MCPDisconnectDialog blast radius", () => {
       has_token: false,
       cleared: true,
       cleared_user_tokens: 2,
+      cleared_client_credentials: false,
     });
     deleteMCPOAuthUserCredential.mockResolvedValue({ server_id: "srv-1", has_credential: false, is_expired: false });
   });
@@ -70,10 +72,8 @@ describe("MCPDisconnectDialog blast radius", () => {
     expect(screen.getByText(SHARED_BLAST_RADIUS)).toHaveTextContent(
       /Anyone who authorized interactively loses upstream access until they authorize again/i,
     );
-    // A machine-to-machine server mints from stored client credentials, so a clear only forces a
-    // fresh mint. Saying it revokes access would be a lie for exactly the servers that keep working.
     expect(screen.getByText(SHARED_BLAST_RADIUS)).toHaveTextContent(
-      /machine-to-machine server keeps the client credentials .* mints a fresh token .* instead of losing access/i,
+      /machine-to-machine server also loses the stored client credentials .* re-enter the client secret/i,
     );
     expect(screen.getByText(SHARED_BLAST_RADIUS)).toHaveTextContent(/BYOK API keys are left alone/i);
     expect(screen.getByText(OWN_BLAST_RADIUS)).toHaveTextContent(/Every other user keeps their connection/i);
@@ -109,6 +109,23 @@ describe("MCPDisconnectDialog blast radius", () => {
 
     await waitFor(() => expect(onCleared).toHaveBeenCalledWith("self"));
     expect(deleteMCPServerOAuthToken).not.toHaveBeenCalled();
+  });
+
+  it("tells the admin to re-enter the client when the M2M grant was dropped", async () => {
+    deleteMCPServerOAuthToken.mockResolvedValue({
+      server_id: "srv-1",
+      has_token: false,
+      cleared: true,
+      cleared_user_tokens: 0,
+      cleared_client_credentials: true,
+    });
+    renderDialog();
+
+    await userEvent.click(screen.getByRole("button", { name: "Disconnect" }));
+
+    await waitFor(() =>
+      expect(toast.success).toHaveBeenCalledWith(expect.stringMatching(/Re-enter the client credentials/i)),
+    );
   });
 
   it("labels the reauthorize entry point and still shows both blast radii", () => {

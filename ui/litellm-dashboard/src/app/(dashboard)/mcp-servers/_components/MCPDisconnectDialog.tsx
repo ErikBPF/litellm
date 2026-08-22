@@ -22,7 +22,7 @@ export const MCP_DISCONNECT_SCOPE_COPY: Record<MCPDisconnectScope, { label: stri
   server: {
     label: "Every stored token for this server (affects all users)",
     blastRadius:
-      "Clears every OAuth token LiteLLM holds for this server, for every user. Anyone who authorized interactively loses upstream access until they authorize again. A machine-to-machine server keeps the client credentials it was configured with, so it mints a fresh token on its next call instead of losing access. Stored BYOK API keys are left alone.",
+      "Clears every OAuth token LiteLLM holds for this server, for every user. Anyone who authorized interactively loses upstream access until they authorize again, and their OAuth app stays configured. A machine-to-machine server also loses the stored client credentials it mints from, so an admin has to re-enter the client secret before it can call upstream again. Stored BYOK API keys are left alone.",
   },
   self: {
     label: "Only your own connection (affects just you)",
@@ -66,7 +66,11 @@ const MCPDisconnectDialog: FC<MCPDisconnectDialogProps> = ({
           result.cleared
             ? `Cleared every stored OAuth token for this server (${result.cleared_user_tokens} user token${
                 result.cleared_user_tokens === 1 ? "" : "s"
-              })`
+              })${
+                result.cleared_client_credentials
+                  ? ". Re-enter the client credentials to let this server mint tokens again"
+                  : ""
+              }`
             : "This server had no stored OAuth token",
         );
       } else {
@@ -93,8 +97,8 @@ const MCPDisconnectDialog: FC<MCPDisconnectDialogProps> = ({
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             {mode === "reauthorize"
-              ? "Clearing the stored token lets you run Authorize & Fetch Token again and grant a different set of upstream scopes. The server's URL, auth type, issuer and OAuth client are kept, so nothing has to be reconfigured."
-              : "Choose what to clear. The server's URL, auth type, issuer and OAuth client are kept, so the server can be authorized again without being recreated."}
+              ? "Clearing the stored token lets you run Authorize & Fetch Token again and grant a different set of upstream scopes. The server's URL, auth type and issuer are kept, so nothing has to be recreated."
+              : "Choose what to clear. The server's URL, auth type and issuer are kept, so the server can be authorized again without being recreated."}
           </p>
           <dl className="space-y-1 rounded-lg border border-border bg-muted p-4">
             {serverName && (

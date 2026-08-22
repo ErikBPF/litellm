@@ -5171,6 +5171,39 @@ class TestMCPServerManager:
         await manager.invalidate_user_oauth_token_cache("alice", "srv-1")
 
     @pytest.mark.asyncio
+    async def test_invalidate_user_oauth_token_cache_broadcasts_the_shared_key(self):
+        """Both per-user caches are local-first, so evicting them here leaves every other worker
+        holding the revoked token until its TTL unless the shared key is broadcast."""
+        from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
+            per_user_token_cache_key,
+        )
+
+        class _Store:
+            async def fetch(self, user_id: str, server_id: str):
+                return None
+
+            async def invalidate(self, user_id: str, server_id: str) -> None:
+                return None
+
+        class _LegacyCache:
+            async def delete(self, user_id: str, server_id: str) -> None:
+                return None
+
+        published: list[str] = []
+
+        async def _publish(cache_key: str) -> None:
+            published.append(cache_key)
+
+        manager = MCPServerManager(
+            per_user_oauth_token_store=_Store(),
+            per_user_token_cache=_LegacyCache(),
+            publish_cache_invalidation=_publish,
+        )
+        await manager.invalidate_user_oauth_token_cache("alice", "srv-1")
+
+        assert published == [per_user_token_cache_key("alice", "srv-1")]
+
+    @pytest.mark.asyncio
     async def test_resolve_oauth2_headers_no_user_id(self):
         """Skip lookup entirely when user_api_key_auth has no user_id."""
         from litellm.proxy._types import UserAPIKeyAuth

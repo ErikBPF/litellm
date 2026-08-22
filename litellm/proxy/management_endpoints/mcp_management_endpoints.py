@@ -165,7 +165,7 @@ if MCP_AVAILABLE:
         global_mcp_server_manager,
     )
     from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
-        mcp_oauth2_token_cache,
+        revoke_mcp_oauth2_mint_cache,
     )
     from litellm.proxy._experimental.mcp_server.ui_session_utils import (
         admitted_user_context,
@@ -2041,8 +2041,10 @@ if MCP_AVAILABLE:
         "/server/{server_id}/oauth-token",
         description=(
             "Clear every OAuth token stored for an MCP server (admin only), so it can be reauthorized "
-            "with a different set of upstream grants. Leaves the declared OAuth app config (url, "
-            "auth_type, issuer, client_id/secret) intact so nothing has to be reconfigured or recreated."
+            "with a different set of upstream grants. An interactive (authorization_code) server keeps "
+            "its declared OAuth app (url, auth_type, issuer, client_id/secret) so users just reconnect; "
+            "a client_credentials server also loses the client_id/secret grant, which is the only way "
+            "to stop it minting a replacement token, so an admin must re-enter the client to resume."
         ),
         response_model=MCPServerOAuthTokenStatus,
     )
@@ -2062,11 +2064,12 @@ if MCP_AVAILABLE:
           - the minted fields on the server row's own credential blob.
         This clears all three. A user's own BYOK API key is never touched.
 
-        Two limits worth stating rather than implying. A client_credentials server mints from the
-        client_id/client_secret it was configured with, so clearing forces a fresh mint rather than
-        revoking access; taking that access away means removing the client, which is a reconfiguration,
-        not a disconnect. And the mint cache is per worker, so on a multi-worker deployment the other
-        workers keep their own minted token until it expires.
+        A client_credentials server mints on demand from its stored client, so the grant itself is the
+        standing authorization and gets dropped with the token; the rest of the declared app stays, and
+        an admin re-enters the client to authorize again. The mint cache is process-local, so the
+        server-level invalidation is broadcast on the auth cache invalidation channel and every worker
+        drops its copy. Without redis pub/sub there is nothing to broadcast over, and a worker that
+        already minted keeps its token until the TTL, but the DB no longer backs a fresh mint.
 
         ```
         curl -X "DELETE" --location 'http://localhost:4000/v1/mcp/server/server_id/oauth-token' \
@@ -2104,15 +2107,16 @@ if MCP_AVAILABLE:
         try:
             cleared_user_tokens: Final = await purge_user_oauth_credentials_for_server(prisma_client, server_id)
         finally:
-            mcp_oauth2_token_cache.invalidate(server_id)
-            if cleared.had_token:
+            await revoke_mcp_oauth2_mint_cache(server_id)
+            if cleared.changed_row:
                 await global_mcp_server_manager.update_server(cleared.server)
 
         return MCPServerOAuthTokenStatus(
             server_id=server_id,
             has_token=False,
-            cleared=cleared.had_token or cleared_user_tokens > 0,
+            cleared=cleared.changed_row or cleared_user_tokens > 0,
             cleared_user_tokens=cleared_user_tokens,
+            cleared_client_credentials=cleared.cleared_client_credentials,
         )
 
     @router.post(

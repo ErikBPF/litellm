@@ -12,7 +12,11 @@ import pytest
 
 from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
     MCPOAuth2TokenCache,
+    apply_mcp_oauth2_mint_invalidation,
+    mcp_oauth2_mint_invalidation_key,
+    mcp_oauth2_token_cache,
     resolve_mcp_auth,
+    revoke_mcp_oauth2_mint_cache,
 )
 from litellm.proxy._types import MCPTransport
 from litellm.types.mcp import MCPAuth
@@ -392,3 +396,42 @@ async def test_invalidate_clears_every_identity_for_a_server():
 
     assert refetched == "tok-after-invalidate"
     assert mock_client.post.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_revoke_broadcasts_so_other_workers_drop_their_minted_token():
+    """The mint cache is process-local, so a revoke that only evicted this worker left every other
+    worker serving the revoked authorization until its TTL."""
+    published: list[str] = []
+
+    async def _publish(cache_key: str) -> None:
+        published.append(cache_key)
+
+    mcp_oauth2_token_cache.set_cache("srv-1:identity", "tok-revoked")
+    mcp_oauth2_token_cache.set_cache("srv-2:identity", "tok-untouched")
+
+    await revoke_mcp_oauth2_mint_cache("srv-1", publish=_publish)
+
+    assert mcp_oauth2_token_cache.get_cache("srv-1:identity") is None
+    assert mcp_oauth2_token_cache.get_cache("srv-2:identity") == "tok-untouched"
+    assert published == [mcp_oauth2_mint_invalidation_key("srv-1")]
+
+
+def test_broadcast_invalidation_drops_only_the_named_server_on_a_receiving_worker():
+    mcp_oauth2_token_cache.set_cache("srv-1:identity", "tok-revoked")
+    mcp_oauth2_token_cache.set_cache("srv-2:identity", "tok-untouched")
+
+    apply_mcp_oauth2_mint_invalidation(mcp_oauth2_mint_invalidation_key("srv-1"))
+
+    assert mcp_oauth2_token_cache.get_cache("srv-1:identity") is None
+    assert mcp_oauth2_token_cache.get_cache("srv-2:identity") == "tok-untouched"
+
+
+def test_broadcast_invalidation_ignores_unrelated_cache_keys():
+    """The channel carries every management-object eviction, so a user key must not be read as a
+    server id and wipe an unrelated server's minted tokens."""
+    mcp_oauth2_token_cache.set_cache("srv-1:identity", "tok-kept")
+
+    apply_mcp_oauth2_mint_invalidation("mcp:per_user_token:user-1:srv-1")
+
+    assert mcp_oauth2_token_cache.get_cache("srv-1:identity") == "tok-kept"

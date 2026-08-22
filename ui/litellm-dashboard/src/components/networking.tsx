@@ -7808,6 +7808,7 @@ export interface MCPServerOAuthTokenStatus {
   has_token: boolean;
   cleared: boolean;
   cleared_user_tokens: number;
+  cleared_client_credentials: boolean;
 }
 
 export interface MCPUserCredentialListItem {

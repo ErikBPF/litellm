@@ -12,7 +12,7 @@ import base64
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1372,6 +1372,9 @@ def _server_row_with_credentials(credentials, **overrides):
         "transport": MCPTransport.http,
         "credentials": credentials,
         "env_vars": None,
+        "oauth2_flow": None,
+        "token_url": None,
+        "authorization_url": None,
     }
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -1490,3 +1493,109 @@ async def test_clear_mcp_server_oauth_token_returns_none_for_missing_server():
 
     assert await clear_mcp_server_oauth_token(prisma, "srv-missing", touched_by="admin-1") is None
     prisma.db.litellm_mcpservertable.update.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_clear_mcp_server_oauth_token_drops_the_client_credentials_grant_for_m2m():
+    """An M2M server mints on demand from its stored client, so a clear that kept the grant left the
+    next request free to mint a replacement token and keep calling upstream."""
+    from litellm.proxy._experimental.mcp_server.db import clear_mcp_server_oauth_token
+
+    stored = {
+        "access_token": "at-live",
+        "client_id": "m2m-client",
+        "client_secret": "m2m-secret",
+        "scopes": ["read"],
+    }
+    prisma = _prisma_with_server_row(
+        _server_row_with_credentials(json.dumps(stored), oauth2_flow="client_credentials")
+    )
+
+    result = await clear_mcp_server_oauth_token(prisma, "srv-clear", touched_by="admin-1")
+
+    assert result is not None
+    assert result.had_token is True
+    assert result.cleared_client_credentials is True
+    assert _written_credentials(prisma) == {"scopes": ["read"]}
+
+
+@pytest.mark.asyncio
+async def test_clear_mcp_server_oauth_token_drops_the_grant_for_an_unstamped_m2m_shaped_row():
+    """Rows written before oauth2_flow was stamped carry the M2M shape instead, and the same
+    inference the request path uses has to classify them here or they keep minting."""
+    from litellm.proxy._experimental.mcp_server.db import clear_mcp_server_oauth_token
+
+    prisma = _prisma_with_server_row(
+        _server_row_with_credentials(
+            json.dumps({"client_id": "m2m-client", "client_secret": "m2m-secret"}),
+            token_url="https://auth.example.com/token",
+        )
+    )
+
+    result = await clear_mcp_server_oauth_token(prisma, "srv-clear", touched_by="admin-1")
+
+    assert result is not None
+    assert result.had_token is False
+    assert result.cleared_client_credentials is True
+    assert result.changed_row is True
+    assert _written_credentials(prisma) == {}
+
+
+@pytest.mark.asyncio
+async def test_clear_mcp_server_oauth_token_keeps_the_client_for_an_interactive_server():
+    """An authorization_code server's authorization lives in the per-user rows the caller purges, so
+    its OAuth app must survive for users to reconnect without an admin reconfiguring it."""
+    from litellm.proxy._experimental.mcp_server.db import clear_mcp_server_oauth_token
+
+    prisma = _prisma_with_server_row(
+        _server_row_with_credentials(
+            json.dumps({"access_token": "at-live", "client_id": "declared-client", "client_secret": "declared-secret"}),
+            oauth2_flow="authorization_code",
+            authorization_url="https://auth.example.com/authorize",
+        )
+    )
+
+    result = await clear_mcp_server_oauth_token(prisma, "srv-clear", touched_by="admin-1")
+
+    assert result is not None
+    assert result.cleared_client_credentials is False
+    assert _written_credentials(prisma) == {"client_id": "declared-client", "client_secret": "declared-secret"}
+
+
+@pytest.mark.asyncio
+async def test_cleared_m2m_row_can_no_longer_mint_a_replacement_token():
+    """End state check: the row the clear persists must fail the mint path's precondition, so no
+    request can quietly re-authorize the server."""
+    from litellm.proxy._experimental.mcp_server.db import clear_mcp_server_oauth_token
+    from litellm.proxy._experimental.mcp_server.oauth2_token_cache import MCPOAuth2TokenCache
+    from litellm.types.mcp_server.mcp_server_manager import MCPServer
+
+    prisma = _prisma_with_server_row(
+        _server_row_with_credentials(
+            json.dumps({"access_token": "at-live", "client_id": "m2m-client", "client_secret": "m2m-secret"}),
+            oauth2_flow="client_credentials",
+        )
+    )
+
+    await clear_mcp_server_oauth_token(prisma, "srv-clear", touched_by="admin-1")
+    remaining = _written_credentials(prisma)
+    server = MCPServer(
+        server_id="srv-clear",
+        name="srv-clear",
+        url="https://upstream.example.com/mcp",
+        transport=MCPTransport.http,
+        auth_type=MCPAuth.oauth2,
+        oauth2_flow="client_credentials",
+        token_url="https://auth.example.com/token",
+        client_id=remaining.get("client_id"),
+        client_secret=remaining.get("client_secret"),
+    )
+    token_endpoint = AsyncMock()
+
+    with patch(
+        "litellm.proxy._experimental.mcp_server.oauth2_token_cache.get_async_httpx_client",
+        return_value=token_endpoint,
+    ):
+        assert await MCPOAuth2TokenCache().async_get_token(server) is None
+
+    token_endpoint.post.assert_not_awaited()

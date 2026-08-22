@@ -42,7 +42,7 @@ from litellm.repositories.verification_token_repository import (
     VerificationTokenRepository,
 )
 from litellm.types.llms.custom_http import httpxSpecialProvider
-from litellm.types.mcp import MCPCredentials
+from litellm.types.mcp import MCPAuth, MCPCredentials
 
 if TYPE_CHECKING:
     from prisma import models as prisma_db_models
@@ -134,6 +134,10 @@ _CLIENT_FORWARDED_AUTH_TYPES: Final["frozenset[str]"] = frozenset({"true_passthr
 
 # Minted token material that must never survive a client rotation on a persisted row.
 _MINTED_TOKEN_CREDENTIAL_FIELDS: Final["frozenset[str]"] = frozenset({"access_token", "refresh_token", "expires_in"})
+
+# For an M2M server the grant IS the standing authorization: the gateway mints on demand, so a
+# disconnect that kept it would just force a remint on the next call instead of ending access.
+_CLIENT_CREDENTIALS_GRANT_FIELDS: Final["frozenset[str]"] = frozenset({"client_id", "client_secret"})
 
 
 class _OAuthCredentialAccessToken(TypedDict):
@@ -1104,33 +1108,73 @@ async def update_mcp_server(
 
 @dataclass(frozen=True, slots=True)
 class ClearedMCPServerOAuthToken:
-    """Outcome of clearing a server's minted OAuth token: the row as persisted, plus whether
-    any minted material was actually present to remove (so the caller can report a no-op)."""
+    """Outcome of clearing a server's stored OAuth authorization: the row as persisted, whether
+    minted token material was present to remove, and whether an M2M client_credentials grant was
+    dropped with it (so the caller can report a no-op, and tell the admin what to re-enter)."""
 
     server: LiteLLM_MCPServerTable
     had_token: bool
+    cleared_client_credentials: bool
+
+    @property
+    def changed_row(self) -> bool:
+        return self.had_token or self.cleared_client_credentials
+
+
+def _credential_str(credentials: Mapping[str, object], key: str) -> str | None:
+    value: Final = credentials.get(key)
+    return value if isinstance(value, str) else None
+
+
+def _oauth_fields_to_clear(
+    row: "prisma_db_models.LiteLLM_MCPServerTable", credentials: Mapping[str, object]
+) -> "frozenset[str]":
+    """Which credential keys a disconnect must remove. An interactive (authorization_code) server
+    keeps its declared client, because its authorization lives in the per-user rows the caller purges
+    separately. A client_credentials server loses the grant too, since keeping it would let the very
+    next request mint a replacement token and continue upstream access.
+    """
+    from litellm.proxy._experimental.mcp_server.mcp_server_manager import (  # noqa: PLC0415  # avoids circular import
+        MCPServerManager,
+    )
+
+    flow: Final = MCPServerManager.resolve_oauth2_flow_from_fields(
+        auth_type=MCPAuth.oauth2 if row.auth_type == MCPAuth.oauth2 else None,
+        oauth2_flow=row.oauth2_flow,
+        token_url=row.token_url or _credential_str(credentials, "token_url"),
+        authorization_url=row.authorization_url,
+        client_id=_credential_str(credentials, "client_id"),
+        client_secret=_credential_str(credentials, "client_secret"),
+    )
+    if flow != "client_credentials":
+        return _MINTED_TOKEN_CREDENTIAL_FIELDS
+    return _MINTED_TOKEN_CREDENTIAL_FIELDS | _CLIENT_CREDENTIALS_GRANT_FIELDS
 
 
 async def clear_mcp_server_oauth_token(
     prisma_client: PrismaClient, server_id: str, touched_by: str
 ) -> ClearedMCPServerOAuthToken | None:
-    """Drop only the gateway-minted token material (``access_token``/``refresh_token``/``expires_in``)
-    from a server's credential blob, leaving the declared app config (url, auth_type, issuer,
-    client_id/client_secret, token-exchange columns) untouched so the admin can reauthorize without
-    reconfiguring. Returns ``None`` when the server row does not exist.
+    """Drop a server's stored OAuth authorization: the gateway-minted token material
+    (``access_token``/``refresh_token``/``expires_in``) always, plus the ``client_id``/``client_secret``
+    grant when the row is a client_credentials (M2M) server, whose grant would otherwise mint again on
+    the next request. Everything else the admin declared (url, auth_type, issuer, authorization/token
+    urls, token-exchange columns) stays, so reauthorizing an interactive server needs no reconfiguration.
+    Returns ``None`` when the server row does not exist.
     """
 
     existing: Final = await _db_find_mcp_server_row(prisma_client, server_id)
     if existing is None:
         return None
 
-    existing_creds: Final = _credentials_blob_to_mutable_dict(existing.credentials) if existing.credentials else None
-    if existing_creds is None or not _MINTED_TOKEN_CREDENTIAL_FIELDS & existing_creds.keys():
+    existing_creds: Final = _credentials_blob_to_mutable_dict(existing.credentials) if existing.credentials else {}
+    fields_to_clear: Final = _oauth_fields_to_clear(existing, existing_creds)
+    cleared_fields: Final = fields_to_clear & existing_creds.keys()
+    if not cleared_fields:
         _decrypt_env_vars_on_returned_row(existing)
-        return ClearedMCPServerOAuthToken(server=existing, had_token=False)
+        return ClearedMCPServerOAuthToken(server=existing, had_token=False, cleared_client_credentials=False)
 
     remaining: Final = {  # mutable-ok: safe_dumps serializes a plain dict and str()s a mapping view
-        key: value for key, value in existing_creds.items() if key not in _MINTED_TOKEN_CREDENTIAL_FIELDS
+        key: value for key, value in existing_creds.items() if key not in fields_to_clear
     }
     updated: Final = await _db_update_mcp_server_row(
         prisma_client,
@@ -1141,7 +1185,11 @@ async def clear_mcp_server_oauth_token(
         },
     )
     _decrypt_env_vars_on_returned_row(updated)
-    return ClearedMCPServerOAuthToken(server=updated, had_token=True)
+    return ClearedMCPServerOAuthToken(
+        server=updated,
+        had_token=bool(_MINTED_TOKEN_CREDENTIAL_FIELDS & cleared_fields),
+        cleared_client_credentials=bool(_CLIENT_CREDENTIALS_GRANT_FIELDS & cleared_fields),
+    )
 
 
 async def get_mcp_server_oauth_client_credentials(prisma_client: PrismaClient, server_id: str) -> object | None:

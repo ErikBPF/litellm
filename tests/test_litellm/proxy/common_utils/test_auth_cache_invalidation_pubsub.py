@@ -159,3 +159,43 @@ async def test_subscriber_ignores_malformed_messages() -> None:
     subscriber._apply_message(None)
 
     assert cache.in_memory_cache.get_cache("project_id:p-1") is not None
+
+
+@pytest.mark.asyncio
+async def test_subscriber_routes_broadcast_keys_to_injected_local_invalidators() -> None:
+    """Some caches a broadcast has to reach are process-local rather than entries in
+    user_api_key_cache (the MCP client_credentials mint cache), so the receiving worker hands every
+    key to the injected handlers as well."""
+    cache = UserApiKeyCache()
+    cache.in_memory_cache.set_cache("project_id:p-1", {"models": []})
+    seen: List[str] = []
+
+    subscriber = AuthCacheInvalidationSubscriber(
+        redis_cache=_FakeRedisCache(client=_ScriptedPubSubRedisClient(pubsubs=[_QueuePubSub()])),
+        user_api_key_cache=cache,
+        local_invalidators=(seen.append,),
+    )
+    subscriber._apply_message(_invalidation_message("project_id:p-1"))
+
+    assert seen == ["project_id:p-1"]
+    assert cache.in_memory_cache.get_cache("project_id:p-1") is None
+
+
+@pytest.mark.asyncio
+async def test_subscriber_survives_a_failing_local_invalidator() -> None:
+    """One handler raising must not stop the others or kill the subscriber loop, which would leave
+    the worker serving stale authorization for every later broadcast."""
+    cache = UserApiKeyCache()
+    seen: List[str] = []
+
+    def _boom(cache_key: str) -> None:
+        raise RuntimeError("handler exploded")
+
+    subscriber = AuthCacheInvalidationSubscriber(
+        redis_cache=_FakeRedisCache(client=_ScriptedPubSubRedisClient(pubsubs=[_QueuePubSub()])),
+        user_api_key_cache=cache,
+        local_invalidators=(_boom, seen.append),
+    )
+    subscriber._apply_message(_invalidation_message("project_id:p-1"))
+
+    assert seen == ["project_id:p-1"]

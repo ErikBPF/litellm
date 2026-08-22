@@ -13,7 +13,7 @@ import json
 import os
 import re
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final, Literal, TypeAlias, TypedDict, cast
@@ -71,6 +71,7 @@ from litellm.proxy._experimental.mcp_server.faults.list_outcomes import (
 from litellm.proxy._experimental.mcp_server.oauth2_token_cache import (
     MCPPerUserTokenCache,
     mcp_per_user_token_cache,
+    per_user_token_cache_key,
     resolve_mcp_auth,
 )
 from litellm.proxy._experimental.mcp_server.oauth_utils import (
@@ -143,6 +144,9 @@ from litellm.proxy._types import (
     UserAPIKeyAuth,
 )
 from litellm.proxy.auth.ip_address_utils import IPAddressUtils
+from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
+    publish_auth_cache_invalidation,
+)
 from litellm.proxy.common_utils.encrypt_decrypt_utils import decrypt_value_helper
 from litellm.proxy.common_utils.user_api_key_cache import get_management_object_ttl
 from litellm.proxy.utils import PrismaClient, ProxyLogging, get_server_root_path
@@ -1399,7 +1403,7 @@ class MCPServerManager:
         return None
 
     @staticmethod
-    def _resolve_oauth2_flow(
+    def resolve_oauth2_flow_from_fields(
         *,
         auth_type: MCPAuthType | None,
         oauth2_flow: str | None,
@@ -1410,8 +1414,9 @@ class MCPServerManager:
     ) -> Literal["client_credentials", "authorization_code"] | None:
         """Infer oauth2_flow from field shape when the value is omitted.
 
-        SECURITY-SENSITIVE: this is the shape-inference engine both request-time security
-        helpers delegate to, so it is what decides M2M-vs-interactive for an unstamped row.
+        SECURITY-SENSITIVE: this is the shape-inference engine the request-time security
+        helpers and the disconnect write path (which must know whether a row's stored client
+        can mint again) delegate to, so it is what decides M2M-vs-interactive for an unstamped row.
         Always access it through ``effective_oauth2_flow`` (boolean/enum decisions) or
         ``resolve_oauth2_flow_for_request`` (the egress object backstop), which are the single
         choke points for request-time resolution; do not call it directly from security sites
@@ -1445,7 +1450,7 @@ class MCPServerManager:
         resolution) goes through this one helper rather than reading the bare
         ``has_client_credentials`` column, which is unreliable for null rows.
         """
-        return MCPServerManager._resolve_oauth2_flow(
+        return MCPServerManager.resolve_oauth2_flow_from_fields(
             auth_type=server.auth_type,
             oauth2_flow=server.oauth2_flow,
             token_url=server.token_url,
@@ -1496,11 +1501,13 @@ class MCPServerManager:
         cred_provider: UpstreamCredentialProvider | None = None,
         per_user_oauth_token_store: InvalidatableOAuthTokenStore | None = None,
         per_user_token_cache: MCPPerUserTokenCache | None = None,
+        publish_cache_invalidation: Callable[[str], Awaitable[None]] = publish_auth_cache_invalidation,
     ):
         self._per_user_oauth_token_store = per_user_oauth_token_store or LazyPerUserOAuthTokenStore(
             self.get_mcp_server_by_id
         )
         self._per_user_token_cache = per_user_token_cache or mcp_per_user_token_cache
+        self._publish_cache_invalidation = publish_cache_invalidation
         self._cred_provider = cred_provider or UpstreamCredentialProvider(
             oauth_token_store=self._per_user_oauth_token_store,
             token_exchanger=build_token_exchanger(),
@@ -5541,9 +5548,10 @@ class MCPServerManager:
         (re-auth, revoke, config-change purge): the v2 chain's cache and the legacy per-user token
         cache, so the next resolve reads the new row instead of serving the replaced token until its
         cache TTL, whichever path resolves it. This is the single invalidation point for per-user
-        OAuth tokens; callers must not evict individual caches directly. Best-effort: a cache-drop
-        failure is logged, never raised, because the DB write already succeeded and the TTL remains
-        the backstop.
+        OAuth tokens; callers must not evict individual caches directly. Both caches are local-first
+        DualCaches, so the shared key is also broadcast on the auth cache invalidation channel to
+        evict the in-memory copy other workers hold. Best-effort: a cache-drop failure is logged,
+        never raised, because the DB write already succeeded and the TTL remains the backstop.
         """
         try:
             await self._per_user_oauth_token_store.invalidate(user_id, server_id)
@@ -5557,6 +5565,7 @@ class MCPServerManager:
             verbose_logger.warning(
                 "Failed to drop legacy cached MCP OAuth token for user=%s server=%s: %s", user_id, server_id, exc
             )
+        await self._publish_cache_invalidation(per_user_token_cache_key(user_id, server_id))
 
     async def _resolve_oauth2_headers_for_tool_call(
         self,
