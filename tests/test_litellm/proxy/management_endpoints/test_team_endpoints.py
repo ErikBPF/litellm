@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Optional, cast
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, call, patch
 
 import pytest
 from fastapi import HTTPException
@@ -147,23 +147,6 @@ def _wire_team_delete_tx(prisma_client):
         litellm_teammembership=prisma_client.db.litellm_teammembership,
         query_raw=AsyncMock(return_value=[]),
         execute_raw=prisma_client.db.execute_raw,
-    )
-    tx_cm = MagicMock()
-    tx_cm.__aenter__ = AsyncMock(return_value=tx)
-    tx_cm.__aexit__ = AsyncMock(return_value=None)
-    prisma_client.tx = MagicMock(return_value=tx_cm)
-
-
-def _wire_member_delete_tx(prisma_client):
-    """/team/member_delete's four cleanups run inside one transaction, so a mocked
-    client has to hand back its own table mocks out of `tx()` for the existing
-    per-table assertions to keep seeing the calls."""
-    tx = SimpleNamespace(
-        litellm_teamtable=prisma_client.db.litellm_teamtable,
-        litellm_usertable=prisma_client.db.litellm_usertable,
-        litellm_teammembership=prisma_client.db.litellm_teammembership,
-        litellm_verificationtoken=prisma_client.db.litellm_verificationtoken,
-        litellm_deletedverificationtoken=prisma_client.db.litellm_deletedverificationtoken,
     )
     tx_cm = MagicMock()
     tx_cm.__aenter__ = AsyncMock(return_value=tx)
@@ -1964,11 +1947,28 @@ async def test_add_team_members_runs_member_writes_on_the_lock_holding_transacti
         _add_team_members_to_team,
     )
 
+    added_user = MagicMock()
+    added_user.user_id = "bob"
+    added_user.model_dump.return_value = {"user_id": "bob", "teams": ["team-pool"]}
+    created_budget = MagicMock()
+    created_budget.budget_id = "budget-pool"
+    membership = MagicMock()
+    membership.model_dump.return_value = {
+        "team_id": "team-pool",
+        "user_id": "bob",
+        "budget_id": "budget-pool",
+        "litellm_budget_table": None,
+    }
+
     tx = MagicMock()
     tx.query_raw = AsyncMock(return_value=[{"members_with_roles": []}])
     tx.litellm_teamtable.update = AsyncMock(
         return_value=LiteLLM_TeamTable(team_id="team-pool", members_with_roles=[])
     )
+    tx.litellm_usertable.upsert = AsyncMock(return_value=added_user)
+    tx.litellm_usertable.update_many = AsyncMock()
+    tx.litellm_budgettable.create = AsyncMock(return_value=created_budget)
+    tx.litellm_teammembership.create = AsyncMock(return_value=membership)
 
     tx_cm = MagicMock()
     tx_cm.__aenter__ = AsyncMock(return_value=tx)
@@ -1976,26 +1976,24 @@ async def test_add_team_members_runs_member_writes_on_the_lock_holding_transacti
 
     prisma_client = MagicMock()
     prisma_client.tx = MagicMock(return_value=tx_cm)
-
-    process_team_members = AsyncMock(return_value=([], []))
-    with patch(
-        "litellm.proxy.management_endpoints.team_endpoints._process_team_members",
-        new=process_team_members,
-    ):
-        await _add_team_members_to_team(
-            data=TeamMemberAddRequest(
-                team_id="team-pool",
-                member=Member(user_id="bob", role="user"),
-            ),
-            complete_team_data=LiteLLM_TeamTable(team_id="team-pool", members_with_roles=[]),
-            prisma_client=cast(object, prisma_client),
-            user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
-            litellm_proxy_admin_name="admin",
-        )
-
-    assert process_team_members.call_args.kwargs["tx"] is tx, (
-        "member writes must reuse the lock holder's connection, not check out another one"
+    type(prisma_client).db = PropertyMock(
+        side_effect=AssertionError("member writes must not reach for a second pooled connection")
     )
+
+    _, updated_users, updated_team_memberships = await _add_team_members_to_team(
+        data=TeamMemberAddRequest(
+            team_id="team-pool",
+            member=Member(user_id="bob", role="user"),
+            max_budget_in_team=50.0,
+        ),
+        complete_team_data=LiteLLM_TeamTable(team_id="team-pool", members_with_roles=[]),
+        prisma_client=cast(object, prisma_client),
+        user_api_key_dict=UserAPIKeyAuth(user_role=LitellmUserRoles.PROXY_ADMIN),
+        litellm_proxy_admin_name="admin",
+    )
+
+    assert [user.user_id for user in updated_users] == ["bob"]
+    assert [tm.budget_id for tm in updated_team_memberships] == ["budget-pool"]
 
 
 @pytest.mark.asyncio
