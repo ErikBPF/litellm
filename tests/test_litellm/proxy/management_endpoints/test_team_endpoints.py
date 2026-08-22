@@ -154,6 +154,23 @@ def _wire_team_delete_tx(prisma_client):
     prisma_client.tx = MagicMock(return_value=tx_cm)
 
 
+def _wire_member_delete_tx(prisma_client):
+    """/team/member_delete's four cleanups run inside one transaction, so a mocked
+    client has to hand back its own table mocks out of `tx()` for the existing
+    per-table assertions to keep seeing the calls."""
+    tx = SimpleNamespace(
+        litellm_teamtable=prisma_client.db.litellm_teamtable,
+        litellm_usertable=prisma_client.db.litellm_usertable,
+        litellm_teammembership=prisma_client.db.litellm_teammembership,
+        litellm_verificationtoken=prisma_client.db.litellm_verificationtoken,
+        litellm_deletedverificationtoken=prisma_client.db.litellm_deletedverificationtoken,
+    )
+    tx_cm = MagicMock()
+    tx_cm.__aenter__ = AsyncMock(return_value=tx)
+    tx_cm.__aexit__ = AsyncMock(return_value=None)
+    prisma_client.tx = MagicMock(return_value=tx_cm)
+
+
 # Mock prisma_client
 mock_prisma_client = MagicMock()
 # Set up async mock for db operations
