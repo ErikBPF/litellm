@@ -47,6 +47,7 @@ from litellm.proxy.auth.auth_checks import (
     _virtual_key_soft_budget_check,
     get_key_object,
     get_user_object,
+    invalidate_team_member_spend_state,
     vector_store_access_check,
 )
 from litellm.caching.in_memory_cache import InMemoryCache
@@ -6939,3 +6940,104 @@ def test_model_has_no_cost_mapping_alias_to_a_group_priced_through_model_info_is
     router = _router_with_a_group_priced_through_model_info()
 
     assert model_has_no_cost_mapping(model="model-info-priced-alias", llm_router=router) is False
+
+
+@pytest.mark.asyncio
+async def test_invalidate_team_member_spend_state_clears_the_spend_counter_and_both_membership_cache_keys():
+    """A team-member budget reset must invalidate the spend counter AND both
+    independently-keyed membership caches (user_api_key_auth.py's admission
+    check writes one key format, budget_reservation.py and auth_checks.py's
+    own get_team_membership() write the other) or a stale read keeps 429ing
+    after the reset. Asserted against real cache reads, not mock call args,
+    so a change that keeps the call but drops its effect still fails."""
+    from litellm.caching.dual_cache import DualCache
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    real_cache = UserApiKeyCache()
+    await real_cache.async_set_cache(key="team-1_user-1", value="stale-membership")
+    await real_cache.async_set_cache(key="team_membership:user-1:team-1", value="stale-membership")
+
+    real_spend_counter_cache = DualCache()
+    real_spend_counter_cache.in_memory_cache.set_cache(key="spend:team_member:user-1:team-1", value=999.0)
+
+    with patch(  # test-quality-ok: injects a real DualCache for the module global, not a behavior mock
+        "litellm.proxy.proxy_server.spend_counter_cache", real_spend_counter_cache
+    ):
+        await invalidate_team_member_spend_state(
+            user_id="user-1",
+            team_id="team-1",
+            user_api_key_cache=real_cache,
+        )
+
+    assert await real_cache.async_get_cache(key="team-1_user-1") is None
+    assert await real_cache.async_get_cache(key="team_membership:user-1:team-1") is None
+    assert real_spend_counter_cache.in_memory_cache.get_cache(key="spend:team_member:user-1:team-1") is None
+
+
+@pytest.mark.asyncio
+async def test_invalidate_team_member_spend_state_broadcasts_the_spend_counter_to_remote_workers():
+    """The test above only proves the handling worker's own spend counter is
+    cleared. A remote worker's spend counter is a separate DualCache instance;
+    if the reset never reaches it, that worker keeps enforcing the pre-reset
+    spend the moment its own Redis read for the counter fails and it falls
+    back to its own (now-stale) in-memory copy. Drives the actual message
+    published onto the invalidation channel through a second, independent
+    AuthCacheInvalidationSubscriber standing in for that remote worker, rather
+    than asserting on the publish call args."""
+    from redis.asyncio import Redis
+
+    from litellm.caching.dual_cache import DualCache
+    from litellm.caching.in_memory_cache import InMemoryCache
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import AuthCacheInvalidationSubscriber
+    from litellm.proxy.common_utils.user_api_key_cache import UserApiKeyCache
+
+    published: list[tuple[str, str]] = []
+
+    class _RecordingRedisClient(Redis):
+        def __init__(self) -> None:
+            pass
+
+        async def publish(self, channel: str, message: str) -> int:
+            published.append((channel, message))
+            return 1
+
+    class _FakeRedisCache:
+        def __init__(self) -> None:
+            self.namespace = None
+
+        def init_async_client(self) -> object:
+            return _RecordingRedisClient()
+
+    local_spend_counter_cache = DualCache()
+
+    remote_user_api_key_cache = UserApiKeyCache()
+    remote_spend_counter_in_memory_cache = InMemoryCache()
+    remote_spend_counter_in_memory_cache.set_cache("spend:team_member:user-1:team-1", 999.0)
+
+    with (
+        patch(  # test-quality-ok: injects a real DualCache for the module global, not a behavior mock
+            "litellm.proxy.proxy_server.spend_counter_cache", local_spend_counter_cache
+        ),
+        patch(  # test-quality-ok: injects a fake pub/sub-capable redis cache; no live redis in this unit test
+            "litellm.proxy.common_utils.auth_cache_invalidation_pubsub.coordination_redis_cache",
+            return_value=_FakeRedisCache(),
+        ),
+    ):
+        await invalidate_team_member_spend_state(
+            user_id="user-1",
+            team_id="team-1",
+            user_api_key_cache=UserApiKeyCache(),
+        )
+
+    spend_counter_messages = [message for _, message in published if "spend:team_member:user-1:team-1" in message]
+    assert spend_counter_messages, "the spend counter reset never reached the cross-worker invalidation channel"
+    published_message = spend_counter_messages[-1]
+
+    remote_subscriber = AuthCacheInvalidationSubscriber(
+        redis_cache=_FakeRedisCache(),
+        user_api_key_cache=remote_user_api_key_cache,
+        additional_in_memory_caches=(remote_spend_counter_in_memory_cache,),
+    )
+    remote_subscriber._apply_message({"type": "message", "data": published_message})
+
+    assert remote_spend_counter_in_memory_cache.get_cache("spend:team_member:user-1:team-1") is None

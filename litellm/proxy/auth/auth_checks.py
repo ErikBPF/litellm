@@ -87,6 +87,8 @@ from litellm.proxy.common_utils.user_api_key_cache import (
     object_permission_cache_key,
     tag_cache_key,
     tag_registry_cache_key,
+    team_membership_auth_cache_key,
+    team_membership_reservation_cache_key,
 )
 from litellm.proxy.db.exception_handler import PrismaDBExceptionHandler
 from litellm.proxy.guardrails.tool_name_extraction import (
@@ -1967,7 +1969,7 @@ async def get_team_membership(
     if user_id is None or team_id is None:
         return None
 
-    _key: Final = f"team_membership:{user_id}:{team_id}"
+    _key: Final = team_membership_reservation_cache_key(user_id=user_id, team_id=team_id)
 
     # check if in cache
     cached_membership_obj: Final = await user_api_key_cache.async_get_cache(
@@ -2400,6 +2402,46 @@ async def _cache_team_object(
                 alias_key,
                 e,
             )
+
+
+async def invalidate_team_member_spend_state(
+    user_id: str,
+    team_id: str,
+    user_api_key_cache: UserApiKeyCache,
+) -> None:
+    """
+    Clear every cached read path for one team member's budget so a spend
+    reset or a raised cap takes effect on the next request instead of
+    waiting on the membership cache's TTL.
+
+    Two independently-keyed cache entries hold the same LiteLLM_TeamMembership
+    row: user_api_key_auth.py's admission check writes ``{team_id}_{user_id}``,
+    while budget_reservation.py's pre-call reservation and auth_checks.py's own
+    get_team_membership() (used by _check_team_member_budget) both write
+    ``team_membership:{user_id}:{team_id}``. Both formats must be invalidated
+    explicitly; writing one does not refresh the other. All three keys are also
+    broadcast (LIT-3803): each worker's own in-memory copy (membership object or
+    spend counter, the latter falling back to its own stale value whenever that
+    worker's Redis read for the counter fails) survives eviction elsewhere until
+    its TTL, so the handling worker alone clearing its copy leaves every other
+    worker still enforcing the pre-reset budget.
+    """
+    from litellm.proxy.common_utils.auth_cache_invalidation_pubsub import (
+        evict_and_broadcast,
+        publish_auth_cache_invalidation,
+    )
+    from litellm.proxy.proxy_server import _invalidate_spend_counter
+
+    spend_counter_key: Final = f"spend:team_member:{user_id}:{team_id}"
+    await _invalidate_spend_counter(counter_key=spend_counter_key)
+    await publish_auth_cache_invalidation(cache_key=spend_counter_key)
+    await evict_and_broadcast(
+        cache_keys=(
+            team_membership_auth_cache_key(team_id=team_id, user_id=user_id),
+            team_membership_reservation_cache_key(user_id=user_id, team_id=team_id),
+        ),
+        user_api_key_cache=user_api_key_cache,
+    )
 
 
 async def delete_cache_team_object(
