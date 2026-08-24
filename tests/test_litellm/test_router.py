@@ -8878,3 +8878,56 @@ class TestAzureBaseModelFallbackLogging:
             deployment=None, received_model_name="my-group", id="azure-base-model-test-id"
         )
         assert model_info["max_input_tokens"] == litellm.model_cost["azure/gpt-4o-mini"]["max_input_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_async_function_with_fallbacks_stamps_zero_attempted_fallbacks():
+    """A request served by the primary model group records attempted_fallbacks=0 and
+    the requested model group in metadata, mirroring the x-litellm-attempted-fallbacks header."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-3.5-turbo",
+                "litellm_params": {"model": "gpt-3.5-turbo", "mock_response": "hi"},
+            }
+        ]
+    )
+    metadata = {}
+
+    await router.acompletion(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": "hey"}],
+        metadata=metadata,
+    )
+
+    assert metadata["attempted_fallbacks"] == 0
+    assert metadata["original_model_group"] == "gpt-3.5-turbo"
+
+
+@pytest.mark.asyncio
+async def test_async_function_with_fallbacks_stamps_route_bucket_not_litellm_metadata():
+    """A chat completion carrying both metadata buckets gets stamped in the route's bucket
+    (metadata), matching where run_async_fallback rewrites, so the two never diverge."""
+    router = litellm.Router(
+        model_list=[
+            {
+                "model_name": "gpt-3.5-turbo",
+                "litellm_params": {"model": "gpt-3.5-turbo", "mock_response": "hi"},
+            }
+        ]
+    )
+    metadata = {}
+    litellm_metadata = {"client_key": "client_value"}
+
+    await router.acompletion(
+        model="gpt-3.5-turbo",
+        messages=[{"role": "user", "content": "hey"}],
+        metadata=metadata,
+        litellm_metadata=litellm_metadata,
+    )
+
+    assert metadata["attempted_fallbacks"] == 0
+    assert metadata["original_model_group"] == "gpt-3.5-turbo"
+    assert litellm_metadata["client_key"] == "client_value"
+    assert "attempted_fallbacks" not in litellm_metadata
+    assert "original_model_group" not in litellm_metadata

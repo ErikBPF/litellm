@@ -6558,6 +6558,13 @@ class Router:
         If it fails after num_retries, fall back to another model group
         """
         model_group: Final[str | None] = kwargs.get("model")
+        _fallback_metadata_key: Final = _get_router_metadata_variable_name(
+            function_name=getattr(kwargs.get("original_function"), "__name__", None)
+        )
+        if isinstance(_fallback_metadata := kwargs.get(_fallback_metadata_key), dict):
+            _fallback_metadata.setdefault("attempted_fallbacks", 0)
+            if model_group is not None:
+                _fallback_metadata.setdefault("original_model_group", model_group)
         include_fallback_errors: Final = kwargs.get("include_fallback_errors", False) is True
         disable_fallbacks: Final[bool | None] = kwargs.pop("disable_fallbacks", False)
         fallbacks: Final[list | None] = kwargs.get("fallbacks", self.fallbacks)
