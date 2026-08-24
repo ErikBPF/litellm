@@ -843,3 +843,45 @@ class TestRunAsyncFallbackTriggersCooldown:
                 )
 
             mock_trigger.assert_not_called()
+
+
+class CapturingRouter:
+    def __init__(self):
+        self.captured_kwargs: dict | None = None
+
+    def log_retry(self, kwargs, e):
+        return kwargs
+
+    async def async_function_with_fallbacks(self, *args, **kwargs):
+        self.captured_kwargs = kwargs
+        return StreamingWrapper()
+
+
+@pytest.mark.asyncio
+async def test_injection_marker_does_not_ride_into_the_fallback_leg():
+    """The marker records that the gateway injected cache breakpoints into THIS
+    attempt's payload, and spend accounting credits prompt-caching savings on it.
+
+    Carrying it forward credits a fallback deployment that injected nothing, which
+    silently restores exactly the inflated savings the gate exists to remove. The
+    fallback leg must earn its own marker or carry none.
+    """
+    router = CapturingRouter()
+
+    await run_async_fallback(
+        litellm_router=router,
+        fallback_model_group=["fallback-model"],
+        original_model_group="primary-model",
+        original_exception=RuntimeError("primary deployment failed"),
+        max_fallbacks=3,
+        fallback_depth=0,
+        metadata={
+            "litellm_injected_cache_breakpoints": 2,
+            "user_api_key": "sk-test",
+        },
+    )
+
+    forwarded_metadata = router.captured_kwargs["metadata"]
+    assert "litellm_injected_cache_breakpoints" not in forwarded_metadata
+    assert forwarded_metadata["user_api_key"] == "sk-test"
+    assert forwarded_metadata["model_group"] == "fallback-model"

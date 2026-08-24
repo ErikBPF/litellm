@@ -23,6 +23,9 @@ from litellm.router_utils.cooldown_handlers import (
 from litellm.router_utils.router_callbacks.track_deployment_metrics import (
     increment_deployment_failures_for_current_minute,
 )
+from litellm.types.integrations.anthropic_cache_control_hook import (
+    INJECTED_CACHE_BREAKPOINTS_METADATA_KEY,
+)
 from litellm.types.router import LiteLLMParamsTypedDict
 
 if TYPE_CHECKING:
@@ -375,7 +378,11 @@ async def run_async_fallback(
             elif isinstance(mg, dict):
                 kwargs.update(mg)
             kwargs[metadata_variable_name] = {
-                **(kwargs.get(metadata_variable_name) or {}),
+                **{
+                    k: v
+                    for k, v in (kwargs.get(metadata_variable_name) or {}).items()
+                    if k != INJECTED_CACHE_BREAKPOINTS_METADATA_KEY
+                },
                 "model_group": kwargs.get("model", None),
             }
             fallback_depth = fallback_depth + 1

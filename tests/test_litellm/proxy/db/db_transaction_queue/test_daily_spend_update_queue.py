@@ -212,6 +212,7 @@ async def test_get_aggregated_daily_spend_update_transactions_same_key():
         "compression_saved_tokens": 0,
         "compression_savings_spend": 0,
         "prompt_caching_savings_spend": 0,
+        "gateway_injected_caching_savings_spend": 0,
         "autorouter_savings_spend": 0,
     }
 
@@ -263,6 +264,7 @@ async def test_flush_and_get_aggregated_daily_spend_update_transactions(
         "compression_saved_tokens": 0,
         "compression_savings_spend": 0,
         "prompt_caching_savings_spend": 0,
+        "gateway_injected_caching_savings_spend": 0,
         "autorouter_savings_spend": 0,
     }
 

@@ -15,6 +15,7 @@ import litellm
 from litellm._logging import verbose_proxy_logger
 from litellm.constants import INTERNAL_CALL_ORIGIN_METADATA_KEY
 from litellm.litellm_core_utils.llm_cost_calc.utils import _get_cost_per_unit, generic_cost_per_token
+from litellm.types.integrations.anthropic_cache_control_hook import INJECTED_CACHE_BREAKPOINTS_METADATA_KEY
 
 if TYPE_CHECKING:
     from litellm.router import Router
@@ -25,6 +26,7 @@ class SavingsSpend(NamedTuple):
     compression: float
     prompt_caching: float
     autorouter: float = 0.0
+    gateway_injected_caching: float = 0.0
 
 
 def _input_cache_read_and_write_cost(info: ModelInfo | None) -> tuple[float, float, float]:
@@ -391,6 +393,21 @@ def _usage_from_spend_log(usage_object: Mapping[str, object] | None) -> Usage | 
         return None
 
 
+def extract_injected_cache_breakpoints(metadata: Mapping[str, object] | None) -> int:
+    """How many cache breakpoints the gateway itself added to this request, or 0.
+
+    Stamped by ``AnthropicCacheControlHook.record_gateway_added_breakpoints`` under
+    ``INJECTED_CACHE_BREAKPOINTS_METADATA_KEY``. Absent on requests the gateway never
+    acted on (client-supplied ``cache_control``, implicit provider caching) and on all
+    rows written before the marker shipped; both read as 0, which is the fail-closed
+    direction for a savings credit.
+    """
+    if not metadata:
+        return 0
+    recorded: Final = metadata.get(INJECTED_CACHE_BREAKPOINTS_METADATA_KEY)
+    return recorded if isinstance(recorded, int) and not isinstance(recorded, bool) and recorded > 0 else 0
+
+
 def extract_cache_read_tokens(usage_object: Mapping[str, object] | None) -> int:
     """Cache-read tokens from a logged usage object, whatever shape recorded them.
 
@@ -533,6 +550,7 @@ def compute_savings_spend(
     model: str | None,
     custom_llm_provider: str | None,
     compression_saved_tokens: int,
+    injected_cache_breakpoints: int,
     routing_decision: Mapping[str, object] | None = None,
     usage_object: Mapping[str, object] | None = None,
     model_id: str | None = None,
@@ -565,7 +583,23 @@ def compute_savings_spend(
     A request that only writes cache and gets no hits therefore reports negative savings,
     which is accurate: it really did cost more than the uncached call would have. The
     daily rollup increments arithmetically, so those rows offset positive ones in the
-    same bucket. Auto-router savings compare the
+    same bucket.
+
+    Caching is reported twice. ``prompt_caching`` is every net dollar caching saved,
+    whoever caused it, which is what a customer means by "what did caching save me".
+    ``gateway_injected_caching`` is the subset the gateway can claim credit for, carrying
+    a value only when ``injected_cache_breakpoints`` is positive, i.e. litellm itself
+    added the ``cache_control`` breakpoints (configured injection points or the auto
+    prompt-caching flag). A client that sent its own breakpoints, and a provider that
+    caches implicitly (OpenAI, Gemini), produce the same usage shape with no gateway
+    action, so they count toward the total and not toward the attributed figure.
+
+    Reporting both rather than gating the one column keeps the customer-facing number
+    stable across the change and leaves attribution a separate question. The attributed
+    figure is normally the smaller of the two, being a subset of the same requests, but
+    not always: a request that only writes cache and never reads it has negative net
+    savings, and dropping such a request from the attributed figure can lift it above
+    the total. Auto-router savings compare the
     served ``model`` against the counterfactual baseline the router recorded on
     its ``routing_decision``, and are zero unless the two differ. That record
     also says whether the conversation was already underway, which is what tells
@@ -602,6 +636,7 @@ def compute_savings_spend(
     read_discount: Final = max(cache_read_input_tokens, 0) * max(input_cost - cache_read_cost, 0.0)
     write_premium: Final = max(cache_creation_input_tokens, 0) * (cache_write_cost - input_cost)
     prompt_caching: Final = read_discount - write_premium
+    gateway_injected_caching: Final = prompt_caching if injected_cache_breakpoints > 0 else 0.0
 
     # The figure the logging path recorded wins, before the usage gate on purpose: a row
     # whose usage no longer parses still carries the number computed when it did.
@@ -623,4 +658,5 @@ def compute_savings_spend(
         compression=compression,
         prompt_caching=prompt_caching,
         autorouter=0.0 if autorouter is None else autorouter,
+        gateway_injected_caching=gateway_injected_caching,
     )

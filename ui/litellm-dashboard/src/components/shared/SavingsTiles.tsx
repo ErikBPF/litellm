@@ -6,6 +6,7 @@ import SummaryCard from "@/components/shared/SummaryCard";
 import {
   autorouterOf,
   cachingOf,
+  gatewayAttributedCachingOf,
   compressionOf,
   savedTokensOf,
   usd,
@@ -25,6 +26,7 @@ export const useSavingsTotals = (results: DailyData[]) =>
       compression,
       caching,
       autorouter,
+      gatewayAttributedCaching: sumOf(gatewayAttributedCachingOf),
       savedTokens: sumOf(savedTokensOf),
       total: compression + caching + autorouter,
     };
@@ -34,7 +36,7 @@ const SavingsTiles = ({ results, isLoading }: { results: DailyData[]; isLoading:
   const totals = useSavingsTotals(results);
 
   return (
-    <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+    <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-5">
       <SummaryCard
         label="Total saved"
         value={usd(totals.total)}
@@ -50,7 +52,13 @@ const SavingsTiles = ({ results, isLoading }: { results: DailyData[]; isLoading:
         label="Prompt caching savings"
         value={usd(totals.caching)}
         hint="Cache reads, net of write premium"
-        info="What caching saved against paying the input rate for every token: the discount on tokens served from cache, less the premium providers charge to write a cache entry. Can be negative on traffic that writes more cache than it reuses."
+        info="What caching saved against paying the input rate for every token: the discount on tokens served from cache, less the premium providers charge to write a cache entry. Counts every cached request, whether the breakpoints came from LiteLLM, from your own client, or from a provider that caches implicitly. Can be negative on traffic that writes more cache than it reuses."
+      />
+      <SummaryCard
+        label="Of which LiteLLM earned"
+        value={usd(totals.gatewayAttributedCaching)}
+        hint="Caching LiteLLM injected for you"
+        info="The share of prompt caching savings that came from breakpoints LiteLLM inserted itself, through configured injection points or auto prompt caching. Requests that arrived with their own cache_control, and providers that cache implicitly, count toward the total above but not here. Usually the smaller of the two, though a request that writes cache it never reads has negative savings, so excluding it can push this figure higher."
       />
       <SummaryCard
         label="Auto-router savings"
