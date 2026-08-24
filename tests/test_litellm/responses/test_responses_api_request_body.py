@@ -598,3 +598,45 @@ def test_responses_custom_api_base_sends_no_openai_markers():
         body = _sent_body(mock_post)
         assert body["input"] == _INJECTION_POINT_INPUT
         assert "prompt_cache_options" not in body
+
+
+def test_injection_points_defer_when_no_input_message_matches_the_target_role():
+    """A Responses request carries its system prompt in `instructions`, not as a message.
+
+    The hook pops its own injection points on the first pass, so consuming them at the
+    Responses layer strands the directive: providers without a native Responses API are
+    served by transforming the request into a chat completion, and that is where
+    `instructions` finally becomes a system message available to inject into. Deferring
+    when nothing here matches is what lets the gateway mark that system message at all.
+    """
+    from litellm.responses.main import _prompt_management_params
+
+    kwargs = {"cache_control_injection_points": copy.deepcopy(_SYSTEM_INJECTION_POINT), "model": "x"}
+
+    deferred = _prompt_management_params(kwargs, [{"role": "user", "content": "hi"}])
+    assert "cache_control_injection_points" not in deferred
+    assert deferred["model"] == "x"
+
+    consumed_here = _prompt_management_params(kwargs, copy.deepcopy(_INJECTION_POINT_INPUT))
+    assert consumed_here["cache_control_injection_points"] == _SYSTEM_INJECTION_POINT
+
+
+@pytest.mark.asyncio
+async def test_injection_points_are_still_consumed_when_input_carries_the_target_role():
+    """The deferral must be narrow: when the target role IS present in `input`, providers
+    that serve Responses natively get their only chance to inject at this layer."""
+    with patch(
+        "litellm.llms.custom_httpx.http_handler.AsyncHTTPHandler.post",
+        new_callable=AsyncMock,
+    ) as mock_post:
+        mock_post.return_value = MockResponse(_minimal_responses_api_payload("resp_defer", "gpt-5.6"), 200)
+
+        await litellm.aresponses(
+            model="openai/gpt-5.6",
+            api_key="fake-api-key",
+            input=copy.deepcopy(_INJECTION_POINT_INPUT),
+            cache_control_injection_points=copy.deepcopy(_SYSTEM_INJECTION_POINT),
+        )
+
+        body = _sent_body(mock_post)
+        assert body["input"][0]["content"][0]["prompt_cache_breakpoint"] == {"mode": "explicit"}

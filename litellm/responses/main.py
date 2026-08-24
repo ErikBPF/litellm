@@ -1,6 +1,6 @@
 import asyncio
 import contextvars
-from collections.abc import Coroutine, Iterable, Mapping
+from collections.abc import Coroutine, Iterable, Mapping, Sequence
 from functools import partial
 from typing import TYPE_CHECKING, Any, Final, Literal, Optional, cast
 
@@ -390,6 +390,38 @@ async def aresponses_api_with_mcp(
     return response
 
 
+_CACHE_CONTROL_INJECTION_POINTS: Final = "cache_control_injection_points"
+
+
+def _prompt_management_params(
+    kwargs: Mapping[str, object],
+    client_input: Sequence[AllMessageValues],
+) -> dict[str, object]:  # mutable-ok: the prompt-management hooks pop their own config out of this dict
+    """Params the prompt-management hooks may act on at the Responses layer.
+
+    Cache-control injection is withheld when no input message matches the configured
+    injection points. A Responses request carries its system prompt in ``instructions``
+    rather than as a message, so a role-targeted point has nothing to attach to here,
+    and the hook pops its own config on the first pass. Consuming it at this layer would
+    strand the directive before the chat-completion request the bridge builds ever grows
+    its system message. Deferring only in that case leaves providers that serve Responses
+    natively, where this layer is the only chance to inject, working as before.
+    """
+    points: Final = kwargs.get(_CACHE_CONTROL_INJECTION_POINTS)
+    if not isinstance(points, list) or _has_injectable_message(points, client_input):
+        return dict(kwargs)
+    return {key: value for key, value in kwargs.items() if key != _CACHE_CONTROL_INJECTION_POINTS}
+
+
+def _has_injectable_message(points: Sequence[object], client_input: Sequence[AllMessageValues]) -> bool:
+    roles: Final = frozenset(
+        message.get("role") for message in client_input if isinstance(message, dict) and message.get("role")
+    )
+    return any(
+        point.get("location") != "message" or point.get("role") in roles for point in points if isinstance(point, dict)
+    )
+
+
 @client
 async def aresponses(
     input: str | ResponseInputParam,
@@ -460,13 +492,17 @@ async def aresponses(
         prompt_variables: Final = cast(dict | None, kwargs.get("prompt_variables", None))
         original_model: Final = model
 
+        if isinstance(input, str):
+            client_input: list[AllMessageValues] = [{"role": "user", "content": input}]
+        else:
+            client_input = [item for item in input if isinstance(item, dict) and "role" in item]
+        prompt_management_params: Final = _prompt_management_params(kwargs, client_input)
+
         if isinstance(
             litellm_logging_obj, LiteLLMLoggingObj
-        ) and litellm_logging_obj.should_run_prompt_management_hooks(prompt_id=prompt_id, non_default_params=kwargs):
-            if isinstance(input, str):
-                client_input: list[AllMessageValues] = [{"role": "user", "content": input}]
-            else:
-                client_input = [item for item in input if isinstance(item, dict) and "role" in item]
+        ) and litellm_logging_obj.should_run_prompt_management_hooks(
+            prompt_id=prompt_id, non_default_params=prompt_management_params
+        ):
             (
                 model,
                 merged_input,
@@ -474,7 +510,7 @@ async def aresponses(
             ) = await litellm_logging_obj.async_get_chat_completion_prompt(
                 model=model,
                 messages=client_input,
-                non_default_params=kwargs,
+                non_default_params=prompt_management_params,
                 prompt_id=prompt_id,
                 prompt_variables=prompt_variables,
                 prompt_label=kwargs.get("prompt_label", None),
@@ -582,8 +618,9 @@ def _apply_prompt_management_to_responses_call(
     else:
         client_input = [item for item in input if isinstance(item, dict) and "role" in item]
 
+    sync_prompt_management_params: Final = _prompt_management_params(kwargs, client_input)
     if isinstance(litellm_logging_obj, LiteLLMLoggingObj) and litellm_logging_obj.should_run_prompt_management_hooks(
-        prompt_id=prompt_id, non_default_params=kwargs
+        prompt_id=prompt_id, non_default_params=sync_prompt_management_params
     ):
         (
             model,
@@ -592,7 +629,7 @@ def _apply_prompt_management_to_responses_call(
         ) = litellm_logging_obj.get_chat_completion_prompt(
             model=model,
             messages=client_input,
-            non_default_params=kwargs,
+            non_default_params=sync_prompt_management_params,
             prompt_id=prompt_id,
             prompt_variables=prompt_variables,
             prompt_label=kwargs.get("prompt_label", None),
