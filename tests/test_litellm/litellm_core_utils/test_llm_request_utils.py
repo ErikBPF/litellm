@@ -1,5 +1,6 @@
 from litellm.litellm_core_utils.llm_request_utils import (
     flatten_form_field_values,
+    merge_flattened_form_fields,
     serialize_multipart_form_fields,
 )
 
@@ -62,3 +63,16 @@ def test_flatten_form_field_values_later_source_wins_on_collision():
         ("seed", "2"),
     )
     assert dict(flatten_form_field_values({"seed": 1}, {"seed": 2}))["seed"] == "2"
+
+
+def test_merge_flattened_form_fields_preserves_array_repeats():
+    merged = merge_flattened_form_fields(
+        flatten_form_field_values(
+            {"tags": ["a", "b"], "items": [{"id": "1"}, {"id": "2"}]},
+        )
+    )
+    assert merged == {"tags[]": ["a", "b"], "items[][id]": ["1", "2"]}
+
+
+def test_merge_flattened_form_fields_keeps_scalar_as_scalar():
+    assert merge_flattened_form_fields(flatten_form_field_values({"seed": 42})) == {"seed": "42"}

@@ -100,6 +100,44 @@ def test_image_edit_flattens_nested_provider_params():
     assert "generation_config" not in fields
 
 
+def _multipart_all_text_fields(content_type: str, body: bytes) -> list[tuple[str, str]]:
+    """Like ``_multipart_text_fields`` but keeps every part, preserving repeated names."""
+    boundary = content_type.split("boundary=")[1].encode()
+    return [
+        (
+            part.split(b'name="')[1].split(b'"')[0].decode(),
+            part.partition(b"\r\n\r\n")[2].rstrip(b"\r\n-").decode(),
+        )
+        for part in body.split(b"--" + boundary)
+        if b'name="' in part and b"filename=" not in part
+    ]
+
+
+def test_image_edit_preserves_array_extra_body_repeats():
+    """A list value in extra_body (or an unknown array kwarg) must be sent as one
+    ``key[]`` multipart part per element, matching the OpenAI SDK. Merging via
+    ``dict.update`` alone collapses the flattened repeats to only the last entry."""
+    captured = {}
+    client = HTTPHandler(client=httpx.Client(transport=httpx.MockTransport(_capture_image_edit_request(captured))))
+
+    litellm.image_edit(
+        model="openai/gpt-image-1",
+        image=PNG_BYTES,
+        prompt="add a hat",
+        api_key="sk-test",
+        api_base="https://edit.example/v1",
+        client=client,
+        extra_body={
+            "tags": ["a", "b"],
+            "items": [{"id": "1"}, {"id": "2"}],
+        },
+    )
+
+    fields = _multipart_all_text_fields(captured["content_type"], captured["body"])
+    assert [v for k, v in fields if k == "tags[]"] == ["a", "b"]
+    assert [v for k, v in fields if k == "items[][id]"] == ["1", "2"]
+
+
 @pytest.mark.asyncio
 async def test_aimage_edit_forwards_extra_body():
     """aimage_edit used to drop extra_headers/extra_query/extra_body when

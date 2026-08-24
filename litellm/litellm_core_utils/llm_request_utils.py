@@ -1,4 +1,5 @@
-from collections.abc import Mapping
+from collections import defaultdict
+from collections.abc import Iterable, Mapping
 from typing import Final
 
 import litellm
@@ -42,6 +43,20 @@ def flatten_form_field_values(*sources: Mapping[str, object] | None) -> tuple[tu
         for top_key, top_value in source.items()
         for pair in _flatten_form_field(top_key, top_value)
     )
+
+
+def merge_flattened_form_fields(
+    fields: Iterable[tuple[str, str]],
+) -> dict[str, str | list[str]]:
+    """
+    Group flattened form-field pairs into a dict, keeping repeats of the same key as a
+    list so ``dict.update`` and httpx ``data=`` emit one part per value instead of
+    collapsing to the last entry, which would silently drop array parts like ``foo[]``.
+    """
+    grouped: Final[defaultdict[str, list[str]]] = defaultdict(list)
+    for key, value in fields:
+        grouped[key].append(value)
+    return {key: values[0] if len(values) == 1 else values for key, values in grouped.items()}
 
 
 def serialize_multipart_form_fields(data: Mapping[str, object]) -> tuple[tuple[str, tuple[None, str]], ...]:
