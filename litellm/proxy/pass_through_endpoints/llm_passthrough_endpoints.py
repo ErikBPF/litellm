@@ -116,16 +116,24 @@ def get_passthrough_router_request_metadata(user_api_key_dict: UserAPIKeyAuth) -
     callback cannot attribute spend to the calling key and never releases the
     budget reservation minted at auth time, so the shared spend counter drifts
     up until the key falsely trips ``BudgetExceededError``.
+
+    Returned under the ``litellm_metadata`` bucket because the router hop
+    (``_ageneric_api_call_with_fallbacks``) writes ``model_group`` into
+    ``litellm_metadata`` and the cost callback reads spend attribution from
+    that same bucket, only backfilling ``user_api_key*`` keys from ``metadata``.
+    Passing this as ``metadata=`` would silently drop secondary attribution
+    fields (``agent_id``, ``user_api_end_user_max_budget``, ...) before the
+    cost callback sees them.
     """
     from litellm.proxy.litellm_pre_call_utils import LiteLLMProxyRequestSetup
 
-    request_data: Final = {"metadata": {}}  # mutable-ok: attribution builder + litellm mutate this dict in place
+    request_data: Final = {"litellm_metadata": {}}  # mutable-ok: attribution builder + litellm mutate this dict in place
     LiteLLMProxyRequestSetup.add_user_api_key_auth_to_request_metadata(
         data=request_data,
         user_api_key_dict=user_api_key_dict,
-        _metadata_variable_name="metadata",
+        _metadata_variable_name="litellm_metadata",
     )
-    return request_data["metadata"]
+    return request_data["litellm_metadata"]
 
 
 async def llm_passthrough_factory_proxy_route(
@@ -368,7 +376,7 @@ async def vllm_proxy_route(
                 params=None,
                 headers=None,
                 cookies=None,
-                metadata=get_passthrough_router_request_metadata(user_api_key_dict),
+                litellm_metadata=get_passthrough_router_request_metadata(user_api_key_dict),
             ),
         )
 
@@ -1498,7 +1506,7 @@ async def azure_proxy_route(
                     params=None,
                     headers=None,
                     cookies=None,
-                    metadata=get_passthrough_router_request_metadata(user_api_key_dict),
+                    litellm_metadata=get_passthrough_router_request_metadata(user_api_key_dict),
                 )
 
                 if is_streaming_request:
