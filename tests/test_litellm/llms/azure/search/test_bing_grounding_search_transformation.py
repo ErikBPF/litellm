@@ -251,6 +251,35 @@ def test_transform_search_response_no_message_output():
     assert _config().transform_search_response(_resp(payload), logging_obj=Mock()).results == []
 
 
+def test_transform_search_response_failed_status_raises_with_error_message():
+    payload = {
+        "output": [],
+        "status": "failed",
+        "error": {"message": "model deployment unavailable", "code": "server_error"},
+    }
+    with pytest.raises(Exception, match="status=failed") as excinfo:
+        _config().transform_search_response(_resp(payload), logging_obj=Mock())
+    assert "model deployment unavailable" in str(excinfo.value)
+
+
+def test_transform_search_response_incomplete_status_raises_with_reason():
+    payload = {
+        "output": [{"type": "reasoning", "content": []}],
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+    }
+    with pytest.raises(Exception, match="status=incomplete") as excinfo:
+        _config().transform_search_response(_resp(payload), logging_obj=Mock())
+    assert "max_output_tokens" in str(excinfo.value)
+
+
+def test_transform_search_response_completed_status_is_reported_as_success():
+    payload = _message_response("text", [_citation("https://example.com", "Example", 4, 30)])
+    payload["status"] = "completed"
+    resp = _config().transform_search_response(_resp(payload), logging_obj=Mock())
+    assert [r.url for r in resp.results] == ["https://example.com"]
+
+
 @pytest.mark.parametrize(
     "body",
     [

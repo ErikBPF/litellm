@@ -83,6 +83,19 @@ class _OutputItem(BaseModel):
     content: tuple[_ContentPart, ...] = ()
 
 
+class _IncompleteDetails(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    reason: str | None = None
+
+
+class _ErrorBody(BaseModel):
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    message: str | None = None
+    code: str | None = None
+
+
 class _ResponsesEnvelope(BaseModel):
     """A Foundry Responses API body. `output` is required: a body without it is not a
     Responses API response and must not be reported as a successful empty search."""
@@ -90,12 +103,9 @@ class _ResponsesEnvelope(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     output: tuple[_OutputItem, ...]
-
-
-class _ErrorBody(BaseModel):
-    model_config = ConfigDict(extra="ignore", frozen=True)
-
-    message: str | None = None
+    status: str | None = None
+    error: _ErrorBody | None = None
+    incomplete_details: _IncompleteDetails | None = None
 
 
 class _ErrorEnvelope(BaseModel):
@@ -124,6 +134,21 @@ def _unwrap_error_detail(error_message: str) -> str:
     except ValidationError:
         return message
     return nested.message or message
+
+
+def _non_completed_status_detail(envelope: _ResponsesEnvelope) -> str:
+    """
+    Explain a non-`completed` Responses API status so callers don't silently record it as
+    a zero-result hit. `failed` populates `error.message`, `incomplete` populates
+    `incomplete_details.reason`; falls back to just the status when neither is set.
+    """
+    status: Final = envelope.status or "unknown"
+    error_message: Final = envelope.error.message if envelope.error else None
+    incomplete_reason: Final = envelope.incomplete_details.reason if envelope.incomplete_details else None
+    detail: Final = error_message or incomplete_reason
+    if detail:
+        return f"grounded search did not complete (status={status}): {detail}"
+    return f"grounded search did not complete (status={status})"
 
 
 def _snippet(text: str, annotation: _Annotation) -> str:
@@ -333,6 +358,12 @@ class BingGroundingSearchConfig(BaseSearchConfig):
         except ValidationError as e:
             raise self.get_error_class(
                 error_message=f"response does not match the Foundry Responses API schema: {e}",
+                status_code=raw_response.status_code,
+                headers=dict(raw_response.headers),  # mutable-ok: BaseSearchConfig.get_error_class signature
+            )
+        if parsed.status is not None and parsed.status != "completed":
+            raise self.get_error_class(
+                error_message=_non_completed_status_detail(parsed),
                 status_code=raw_response.status_code,
                 headers=dict(raw_response.headers),  # mutable-ok: BaseSearchConfig.get_error_class signature
             )
