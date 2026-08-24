@@ -195,6 +195,19 @@ def test_transform_search_request_connection_mode_omits_count_without_max_result
     assert body["tools"][0]["bing_grounding"]["search_configurations"] == [{"project_connection_id": "conn-id"}]
 
 
+@pytest.mark.parametrize("max_results", [0, -1, True, False])
+def test_transform_search_request_connection_mode_omits_invalid_max_results_as_count(
+    monkeypatch: pytest.MonkeyPatch, max_results: object
+):
+    """Connection mode's `count` must honor the same predicate as the response-side cap:
+    non-positive ints and bools (bool is an int subclass) are rejected in both directions
+    so Foundry never sees a `count` the response transformer would ignore as a real cap."""
+    monkeypatch.setenv("BING_GROUNDING_MODEL", "gpt-4.1")
+    monkeypatch.setenv("BING_GROUNDING_CONNECTION_ID", "conn-id")
+    body = _config().transform_search_request("q", {"max_results": max_results})
+    assert body["tools"][0]["bing_grounding"]["search_configurations"] == [{"project_connection_id": "conn-id"}]
+
+
 def test_transform_search_request_joins_list_query(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("BING_GROUNDING_MODEL", "gpt-4.1")
     assert _config().transform_search_request(["foo", "bar"], {})["input"] == "foo bar"

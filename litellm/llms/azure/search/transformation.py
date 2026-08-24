@@ -178,6 +178,15 @@ def _citation_results(envelope: _ResponsesEnvelope) -> tuple[SearchResult, ...]:
     return tuple(first_by_url[url] for url in dict.fromkeys(result.url for result in cited))
 
 
+def _valid_max_results(max_results: object) -> int | None:
+    """The caller's `max_results` normalized to a positive int, or None. Rejects bools
+    (which are `int` subclasses) and non-positive values so neither the request-side
+    `count` nor the response-side cap ever forwards a value the other would ignore."""
+    return (
+        max_results if isinstance(max_results, int) and not isinstance(max_results, bool) and max_results > 0 else None
+    )
+
+
 def _requested_max_results(response_kwargs: Mapping[str, object]) -> int | None:
     """The unified `max_results` cap the caller asked for, if any.
 
@@ -188,10 +197,7 @@ def _requested_max_results(response_kwargs: Mapping[str, object]) -> int | None:
     optional_params: Final = response_kwargs.get("optional_params")
     if not isinstance(optional_params, Mapping):
         return None
-    max_results: Final = optional_params.get("max_results")
-    return (
-        max_results if isinstance(max_results, int) and not isinstance(max_results, bool) and max_results > 0 else None
-    )
+    return _valid_max_results(optional_params.get("max_results"))
 
 
 def _capped(results: tuple[SearchResult, ...], max_results: int | None) -> tuple[SearchResult, ...]:
@@ -242,12 +248,11 @@ class _ResponsesRequest(BaseModel):
 
 def _search_tool(optional_params: Mapping[str, object]) -> _BingGroundingTool | _WebSearchTool:
     connection_id: Final = get_secret_str(CONNECTION_ID_ENV)
-    max_results: Final = optional_params.get("max_results")
     country: Final = optional_params.get("country")
     if connection_id:
         configuration: Final = _SearchConfiguration(
             project_connection_id=connection_id,
-            count=max_results if isinstance(max_results, int) else None,
+            count=_valid_max_results(optional_params.get("max_results")),
         )
         return _BingGroundingTool(bing_grounding=_BingGroundingParams(search_configurations=(configuration,)))
     location: Final = _UserLocation(country=country.upper()) if isinstance(country, str) else None
